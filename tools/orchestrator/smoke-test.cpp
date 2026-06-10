@@ -7,11 +7,30 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <sstream>
+#include <string>
 #include <vector>
+
+// parse a comma-separated device list like "0,1,2,3" into {0,1,2,3}
+static std::vector<int> parse_devices(const std::string & s) {
+    std::vector<int> out;
+    std::stringstream ss(s);
+    std::string tok;
+    while (std::getline(ss, tok, ',')) {
+        if (!tok.empty()) {
+            out.push_back(std::stoi(tok));
+        }
+    }
+    return out;
+}
 
 int main(int argc, char ** argv) {
     if (argc < 2) {
-        fprintf(stderr, "usage: %s <model.gguf> [n_replicas]\n", argv[0]);
+        fprintf(stderr,
+                "usage: %s <model.gguf> [devices] [n_gpu_layers]\n"
+                "  devices:      comma-separated GPU indices (default \"0,0\" = 2 replicas on GPU 0)\n"
+                "  n_gpu_layers: layers to offload per replica (default 99 = all; 0 = keep on CPU)\n",
+                argv[0]);
         return 1;
     }
 
@@ -20,12 +39,17 @@ int main(int argc, char ** argv) {
 
     common_params params;
     params.model.path   = argv[1];
-    params.n_gpu_layers = 0; // CPU-only smoke test
+    params.n_gpu_layers = (argc >= 4) ? atoi(argv[3]) : 99; // offload all by default
 
-    const int n = (argc >= 3) ? atoi(argv[2]) : 2;
-    std::vector<int> devices(n, 0); // all replicas on "device 0" (CPU here)
+    std::vector<int> devices = parse_devices((argc >= 3) ? argv[2] : "0,0");
+    const int n = (int) devices.size();
+    if (n == 0) {
+        fprintf(stderr, "[smoke] FAIL: empty device list\n");
+        return 1;
+    }
 
-    printf("\n[smoke] building %d replica(s) from '%s'\n", n, params.model.path.c_str());
+    printf("\n[smoke] building %d replica(s) from '%s' (n_gpu_layers=%d)\n",
+           n, params.model.path.c_str(), params.n_gpu_layers);
 
     auto pool = orchestrator_make_pool(params, devices);
     if (!pool) {
@@ -40,8 +64,10 @@ int main(int argc, char ** argv) {
 
     for (int i = 0; i < pool->size(); ++i) {
         orchestrator_replica_info info = pool->at(i);
-        printf("[smoke] at(%d): index=%d device=%d\n", i, info.index, info.device);
+        printf("[smoke] at(%d): index=%d device=%d (expected device=%d)\n",
+               i, info.index, info.device, devices[i]);
         ok &= (info.index == i);
+        ok &= (info.device == devices[i]);
     }
 
     const llama_model * m = pool->model();
