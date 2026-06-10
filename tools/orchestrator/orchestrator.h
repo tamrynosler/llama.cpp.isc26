@@ -56,6 +56,9 @@ struct orchestrator_pool {
     // block until every job submitted since the previous drain() (or since
     // construction) has finished; return that batch's stats. reusable: the clock
     // resets at the first dispatch of each batch.
+    // stats are coherent only for one producer that submits a whole batch, drains
+    // it fully, then submits the next. overlapping submit() with drain() (or from
+    // multiple threads) conflates batches into one span and count.
     orchestrator_run_stats drain();
 
     ~orchestrator_pool();

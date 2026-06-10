@@ -5,10 +5,13 @@
 #include "common.h"
 #include "llama.h"
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <sstream>
+#include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 // parse a comma-separated device list like "0,1,2,3" into {0,1,2,3}
@@ -77,6 +80,64 @@ int main(int argc, char ** argv) {
     } else {
         printf("[smoke] FAIL: model() returned null\n");
         ok = false;
+    }
+
+    // S6: serial submit/drain. K distinct-slot jobs all succeed; then one false
+    // and one throwing job both register as failures.
+    {
+        const int K = 8;
+        std::vector<int> results(K, -1);
+        for (int i = 0; i < K; ++i) {
+            pool->submit([&results, i](llama_context *, int) {
+                results[i] = i; // distinct slot per job, no shared accumulator
+                return true;
+            });
+        }
+        orchestrator_run_stats st = pool->drain();
+        printf("[smoke] drain: n_jobs=%zu n_failed=%zu ok=%d\n", st.n_jobs, st.n_failed, st.ok());
+        ok &= (st.n_jobs == (size_t) K) && (st.n_failed == 0) && st.ok();
+        for (int i = 0; i < K; ++i) {
+            ok &= (results[i] == i);
+        }
+
+        pool->submit([](llama_context *, int) { return false; });
+        pool->submit([](llama_context *, int) -> bool { throw std::runtime_error("boom"); });
+        orchestrator_run_stats st2 = pool->drain();
+        printf("[smoke] drain2: n_jobs=%zu n_failed=%zu\n", st2.n_jobs, st2.n_failed);
+        ok &= (st2.n_jobs == 2) && (st2.n_failed == 2) && !st2.ok();
+    }
+
+    // S7: concurrent dispatch. K >> n_replicas lightweight jobs run across the
+    // worker threads; verify the same accounting holds under real concurrency.
+    {
+        const int K = 64;
+        std::vector<int> results(K, -1);
+        std::vector<int> per_replica(pool->size(), 0); // worker r is the only writer of slot r
+        for (int i = 0; i < K; ++i) {
+            pool->submit([&results, &per_replica, i](llama_context *, int r) {
+                // brief work so workers actually overlap - this is what gives the
+                // TSan gate real concurrency to inspect, not a timing hack.
+                std::this_thread::sleep_for(std::chrono::microseconds(200));
+                results[i] = i;      // distinct slot per job
+                per_replica[r]++;    // distinct slot per worker
+                return true;
+            });
+        }
+        orchestrator_run_stats st = pool->drain();
+        printf("[smoke] concurrent drain: n_jobs=%zu n_failed=%zu seconds=%.6f\n",
+               st.n_jobs, st.n_failed, st.seconds);
+        // seconds >= 0 is the real invariant (a negative span would mean the clock
+        // ran backwards); magnitude is proven by the real decode workloads later.
+        ok &= (st.n_jobs == (size_t) K) && (st.n_failed == 0) && st.ok() && (st.seconds >= 0.0);
+        for (int i = 0; i < K; ++i) {
+            ok &= (results[i] == i); // every job ran exactly once
+        }
+        size_t total = 0;
+        for (int r = 0; r < pool->size(); ++r) {
+            printf("[smoke]   replica %d ran %d job(s)\n", r, per_replica[r]);
+            total += per_replica[r];
+        }
+        ok &= (total == (size_t) K); // jobs distributed across replicas, none lost
     }
 
     printf("[smoke] tearing down pool...\n");
