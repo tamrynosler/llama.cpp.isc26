@@ -459,6 +459,10 @@ struct common_params {
 
     enum llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER; // how to split the model across GPUs
 
+    // data-parallel (orchestrator): N independent model replicas dispatched concurrently
+    int32_t          n_data_parallel = 1; // number of replicas; 1 = orchestrator off (no-op)
+    std::vector<int> dp_devices;          // GPU indices for replicas; empty = default 0..N-1
+
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;
 

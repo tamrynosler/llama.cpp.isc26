@@ -2429,6 +2429,25 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MAIN_GPU"));
     add_opt(common_arg(
+        {"--data-parallel", "-dp"}, "N",
+        "number of independent model replicas to run concurrently (data-parallel orchestrator);\n"
+        "1 (default) leaves the orchestrator off and is a no-op. Replicas scale throughput, not latency.",
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("--data-parallel must be >= 1");
+            }
+            params.n_data_parallel = value;
+        }
+    ).set_env("LLAMA_ARG_DATA_PARALLEL"));
+    add_opt(common_arg(
+        {"--dp-devices"}, "i,j,k,...",
+        "comma-separated GPU indices to pin data-parallel replicas to (repeats allowed for\n"
+        "oversubscription, e.g. 0,0,1,1); empty (default) pins replicas to GPUs 0..N-1",
+        [](common_params & params, const std::string & value) {
+            params.dp_devices = string_split<int>(value, ',');
+        }
+    ).set_env("LLAMA_ARG_DP_DEVICES"));
+    add_opt(common_arg(
         { "-fit", "--fit" }, "[on|off]",
         string_format("whether to adjust unset arguments to fit in device memory ('on' or 'off', default: '%s')", params.fit_params ? "on" : "off"),
         [](common_params & params, const std::string & value) {
