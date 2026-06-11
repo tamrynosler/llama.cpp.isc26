@@ -5,6 +5,7 @@
 #include "common.h"
 #include "llama.h"
 
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -43,6 +44,9 @@ int main(int argc, char ** argv) {
     common_params params;
     params.model.path   = argv[1];
     params.n_gpu_layers = (argc >= 4) ? atoi(argv[3]) : 99; // offload all by default
+    params.n_parallel   = 4; // A1: build each context with 4 sequence slots (n_seq_max),
+                             // so continuous batching can be added later without a rebuild.
+                             // make_pool logs the resulting n_seq_max.
 
     std::vector<int> devices = parse_devices((argc >= 3) ? argv[2] : "0,0");
     const int n = (int) devices.size();
@@ -138,6 +142,55 @@ int main(int argc, char ** argv) {
             total += per_replica[r];
         }
         ok &= (total == (size_t) K); // jobs distributed across replicas, none lost
+
+        // C: per-job latency distribution is populated and monotone.
+        printf("[smoke] latency ms: min=%.3f p50=%.3f p95=%.3f p99=%.3f max=%.3f mean=%.3f\n",
+               st.lat_ms_min, st.lat_ms_p50, st.lat_ms_p95, st.lat_ms_p99, st.lat_ms_max, st.lat_ms_mean);
+        ok &= (st.lat_ms_min <= st.lat_ms_p50) && (st.lat_ms_p50 <= st.lat_ms_p95) &&
+              (st.lat_ms_p95 <= st.lat_ms_p99) && (st.lat_ms_p99 <= st.lat_ms_max) &&
+              (st.lat_ms_mean > 0.0);
+    }
+
+    // B: best-effort timeout. arm a short deadline; a job that polls deadline_expired()
+    // should see it flip and report failure. (The abort callback itself needs a real
+    // llama_decode, so it is exercised on the cluster, not here.)
+    {
+        pool->set_timeout_ms(5);
+        std::atomic<bool> saw_expiry{false};
+        orchestrator_pool * pp = pool.get();
+        pool->submit([pp, &saw_expiry](llama_context *, int r) {
+            // spin until the deadline trips, capped at ~2 s so a bug can't hang the test.
+            const auto t0 = std::chrono::steady_clock::now();
+            while (!pp->deadline_expired(r)) {
+                if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(2)) {
+                    return true; // deadline never fired - assertion below will flag it
+                }
+                std::this_thread::sleep_for(std::chrono::microseconds(100));
+            }
+            saw_expiry = true;
+            return false; // an over-deadline job reports failure
+        });
+        orchestrator_run_stats st = pool->drain();
+        printf("[smoke] timeout drain: n_jobs=%zu n_failed=%zu saw_expiry=%d\n",
+               st.n_jobs, st.n_failed, (int) saw_expiry.load());
+        ok &= (st.n_jobs == 1) && (st.n_failed == 1) && saw_expiry.load();
+        pool->set_timeout_ms(0); // disarm for any later batches
+    }
+
+    // A2: spec-based factory + device-group metadata. the main pool was built via the
+    // vector<int> convenience wrapper, which maps each index to a single-device spec, so
+    // its at() metadata exercises the new fields. assert they round-trip. the true
+    // multi-GPU split path (devices.size() >= 2) needs >= 2 GPUs and so is exercised on the
+    // cluster, not here - a 1-GPU Mac correctly rejects a 2-device spec at load time.
+    {
+        bool meta_ok = true;
+        for (int i = 0; i < pool->size(); ++i) {
+            orchestrator_replica_info info = pool->at(i);
+            meta_ok &= (info.devices.size() == 1) && (info.devices[0] == devices[i]) &&
+                       (info.split_mode == LLAMA_SPLIT_MODE_NONE);
+        }
+        printf("[smoke] A2: single-device spec metadata round-trips: %d\n", (int) meta_ok);
+        ok &= meta_ok;
     }
 
     printf("[smoke] tearing down pool...\n");
