@@ -92,13 +92,13 @@ for M in "${MODELS[@]}"; do
   export CUDA_VISIBLE_DEVICES=0
   run "FORK | $name | 1 GPU | default" \
       "$RESULTS/${name}.1gpu-default.log" \
-      "$BIN" -m "$M" -bf "$INPUT" --ctx-size "$CTX" -ngl "$NGL"
+      "$BIN" -m "$M" -bf "$INPUT" --ctx-size "$CTX" -ngl "$NGL" -b 512
 
   # (B) 4 GPUs via the orchestrator - throughput scaling + PPL (must equal run A)
   export CUDA_VISIBLE_DEVICES=0,1,2,3
   run "FORK | $name | 4 GPUs | --data-parallel $DP" \
       "$RESULTS/${name}.4gpu-dp.log" \
-      "$BIN" -m "$M" -bf "$INPUT" --ctx-size "$CTX" -ngl "$NGL" \
+      "$BIN" -m "$M" -bf "$INPUT" --ctx-size "$CTX" -ngl "$NGL" -b 512 \
              --data-parallel "$DP" --dp-devices 0,1,2,3
 done
 
