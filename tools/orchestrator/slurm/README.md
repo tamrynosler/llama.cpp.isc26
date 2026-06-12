@@ -9,6 +9,7 @@ node of the target cluster (4x H100). Logs land in `results/<job>-<jobid>/`.
 |--------|-----------------|--------------|
 | `baseline-original.slurm` | original upstream `~/llama.cpp` | 3 models, 1 GPU, default perplexity. The reference numbers. |
 | `dp-orchestrator.slurm`   | this fork `~/llama.cpp.isc26` | per model: 1 GPU default, 1 GPU matched (`-b $CTX`), 4 GPUs `--data-parallel 4`. |
+| `dp-batched-bench.slurm`  | this fork `~/llama.cpp.isc26` | per model: 1 GPU baseline vs 4 GPUs `--data-parallel 4` batched-bench. The GPU-bound throughput showcase; compare the DP `ALL` row against the 1-GPU row. No input dataset (random tokens). |
 
 Fill in the `MODELS`, repo paths, and `INPUT` variables at the top of each
 script (use the **same 3 models** in both). Build the relevant repo with
