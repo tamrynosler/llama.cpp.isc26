@@ -35,12 +35,14 @@ MODELS=(
   "$HOME/models/OLMo-2-1124-13B-Instruct-Q4_0.gguf"
   "$HOME/models/Qwen_Qwen3.6-35B-A3B-Q4_0.gguf"
 )
-CTX=16384            # per-replica context; must hold the largest config: max(PL)*(PP+TG) <= CTX
+CTX=65536            # per-replica context; must hold the largest config: max(PL)*(PP+TG) <= CTX
 NGL=99               # offload all layers to the GPU (orchestrator warns, does not force this)
 DP=4                 # replicas across the node's 4 GPUs
+NBATCH=4096          # logical batch (-b): fatter prefill launches, lifts S_PP scaling
+UBATCH=2048          # physical micro-batch (-ub)
 PP=512               # prompt lengths to sweep (comma-separated ok, e.g. 128,256,512)
 TG=128               # generation lengths
-PL=1,2,4,8,16        # parallel sequences per replica
+PL=1,2,4,8,16,32,64  # parallel sequences per replica (higher pl = the main throughput lever)
 # -----------------------------------------------------------------------------
 
 ml gcc cuda          # pin versions if needed: ml gcc/15.2 cuda/13.1
@@ -73,13 +75,13 @@ for M in "${MODELS[@]}"; do
   export CUDA_VISIBLE_DEVICES=0
   run "FORK | $name | 1 GPU | baseline" \
       "$RESULTS/${name}.1gpu.log" \
-      "$BIN" -m "$M" -c "$CTX" -ngl "$NGL" -npp "$PP" -ntg "$TG" -npl "$PL"
+      "$BIN" -m "$M" -c "$CTX" -b "$NBATCH" -ub "$UBATCH" -ngl "$NGL" -npp "$PP" -ntg "$TG" -npl "$PL"
 
   # (B) 4 GPUs via the orchestrator - weak-scaling aggregate (ALL row)
   export CUDA_VISIBLE_DEVICES=0,1,2,3
   run "FORK | $name | 4 GPUs | --data-parallel $DP" \
       "$RESULTS/${name}.4gpu-dp.log" \
-      "$BIN" -m "$M" -c "$CTX" -ngl "$NGL" -npp "$PP" -ntg "$TG" -npl "$PL" \
+      "$BIN" -m "$M" -c "$CTX" -b "$NBATCH" -ub "$UBATCH" -ngl "$NGL" -npp "$PP" -ntg "$TG" -npl "$PL" \
              --data-parallel "$DP" --dp-devices 0,1,2,3
 done
 
