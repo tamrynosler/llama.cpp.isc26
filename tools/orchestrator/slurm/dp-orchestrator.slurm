@@ -27,11 +27,11 @@ set -uo pipefail
 # ---- fill these in ----------------------------------------------------------
 REPO="$HOME/llama.cpp.isc26"
 BIN="$REPO/build/bin/llama-perplexity"
-INPUT="$HOME/data/wikitext-2-raw/wiki.test.raw"
+INPUT="$HOME/datasets/wikitext-2-raw/wiki.test.raw"
 MODELS=(
-  "/path/to/model1.gguf"   # TODO: SAME 3 models as baseline-original.slurm
-  "/path/to/model2.gguf"   # TODO
-  "/path/to/model3.gguf"   # TODO
+  "$HOME/models/gemma-4-E2B-it-qat-q4_0.gguf"   # TODO: SAME 3 models as baseline-original.slurm
+  "$HOME/models/qwen2.5-1.5b-instruct-q5_k_m.gguf"   # TODO
+  "$HOME/models/qwen2.5-3b-instruct-q5_k_m.gguf"   # TODO
 )
 CTX=512        # perplexity context window
 NGL=99         # offload all layers to the GPU (required: orchestrator warns, does not force this)
@@ -70,19 +70,19 @@ for M in "${MODELS[@]}"; do
   export CUDA_VISIBLE_DEVICES=0
   run "FORK | $name | 1 GPU | default batching" \
       "$RESULTS/${name}.1gpu-default.log" \
-      "$BIN" -m "$M" -f "$INPUT" --ctx-size "$CTX" -ngl "$NGL"
+      "$BIN" -m "$M" -bf "$INPUT" --ctx-size "$CTX" -ngl "$NGL"
 
   # (2) 1 GPU, -b $CTX => n_seq=1 - matched granularity for the exact legality check
   export CUDA_VISIBLE_DEVICES=0
   run "FORK | $name | 1 GPU | -b $CTX (n_seq=1, matched)" \
       "$RESULTS/${name}.1gpu-matched.log" \
-      "$BIN" -m "$M" -f "$INPUT" --ctx-size "$CTX" -ngl "$NGL" -b "$CTX"
+      "$BIN" -m "$M" -bf "$INPUT" --ctx-size "$CTX" -ngl "$NGL" -b "$CTX"
 
   # (3) 4 GPUs via the orchestrator - throughput + PPL (should equal run 2 exactly)
   export CUDA_VISIBLE_DEVICES=0,1,2,3
   run "FORK | $name | 4 GPUs | --data-parallel $DP" \
       "$RESULTS/${name}.4gpu-dp.log" \
-      "$BIN" -m "$M" -f "$INPUT" --ctx-size "$CTX" -ngl "$NGL" \
+      "$BIN" -m "$M" -bf "$INPUT" --ctx-size "$CTX" -ngl "$NGL" \
              --data-parallel "$DP" --dp-devices 0,1,2,3
 done
 

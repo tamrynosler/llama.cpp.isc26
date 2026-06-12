@@ -22,11 +22,11 @@ set -uo pipefail
 # ---- fill these in ----------------------------------------------------------
 ORIG_REPO="$HOME/llama.cpp"                              # original upstream checkout
 ORIG_BIN="$ORIG_REPO/build/bin/llama-perplexity"        # build with -DGGML_CUDA=ON first
-INPUT="$HOME/data/wikitext-2-raw/wiki.test.raw"         # perplexity input text (see README)
+INPUT="$HOME/datasets/wikitext-2-raw/wiki.test.raw"     # perplexity input text (see README)
 MODELS=(
-  "/path/to/model1.gguf"   # TODO: fill in - use the SAME 3 models in dp-orchestrator.slurm
-  "/path/to/model2.gguf"   # TODO
-  "/path/to/model3.gguf"   # TODO
+  "$HOME/models/gemma-4-E2B-it-qat-q4_0.gguf"        # SAME 3 models as dp-orchestrator.slurm
+  "$HOME/models/qwen2.5-1.5b-instruct-q5_k_m.gguf"
+  "$HOME/models/qwen2.5-3b-instruct-q5_k_m.gguf"
 )
 CTX=512        # standard perplexity context window
 NGL=99         # offload all layers to the GPU
@@ -51,7 +51,7 @@ for M in "${MODELS[@]}"; do
   name="$(basename "$M" .gguf)"
   log="$RESULTS/${name}.1gpu.log"
   echo "=== ORIGINAL | $name | 1 GPU | ctx=$CTX ngl=$NGL ==="
-  if $TIME "$ORIG_BIN" -m "$M" -f "$INPUT" --ctx-size "$CTX" -ngl "$NGL" > "$log" 2>&1; then
+  if $TIME "$ORIG_BIN" -m "$M" -bf "$INPUT" --ctx-size "$CTX" -ngl "$NGL" > "$log" 2>&1; then
     grep -iE "Final estimate|perf_context_print|Elapsed \(wall" "$log" || true
   else
     echo "FAILED ($name) - see $log"; tail -n 20 "$log"
