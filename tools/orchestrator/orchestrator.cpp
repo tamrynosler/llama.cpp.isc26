@@ -342,19 +342,29 @@ std::unique_ptr<orchestrator_pool> orchestrator_make_pool(
                 __func__, cparams.n_ctx, cparams.n_seq_max);
     }
 
-    // build the replicas one at a time. two things can go wrong per replica - loading the
-    // model file, and opening a context on it - and we report them separately.
-    for (size_t r = 0; r < specs.size(); ++r) {
+    // build the replicas in parallel - one thread per replica. each replica's model load +
+    // context creation is independent (a distinct GPU, or CPU), and loading them serially was
+    // the dominant fixed cost (nsys: a 4-step H2D staircase + serial cudaMallocHost, ~70% of a
+    // short run). the threads write DISTINCT pre-sized slots, so no lock is needed around the
+    // shared vector; everything else they read (gpus, cparams, params, specs) is read-only here.
+    orchestrator_pool::impl * p = pool->pimpl.get();
+    p->replicas.resize(specs.size());
+    std::vector<char> ok(specs.size(), 0); // per-replica success (char avoids vector<bool>)
+
+    // __func__ inside the lambda would resolve to its operator(); capture the real name.
+    const char * const fn = __func__;
+
+    auto build_one = [&](size_t r) {
         const orchestrator_replica_spec & spec = specs[r];
         if (spec.devices.empty()) {
-            LOG_ERR("%s: [replica %zu] empty device list in spec\n", __func__, r);
-            return nullptr;
+            LOG_ERR("%s: [replica %zu] empty device list in spec\n", fn, r);
+            return;
         }
 
         auto mparams = common_model_params_to_llama(params);
 
-        // device handles for a multi-device split, NULL-terminated for llama. declared here
-        // so it outlives the load call below (mparams.devices points into it).
+        // device handles for a multi-device split, NULL-terminated for llama. local to this
+        // thread so it outlives the load call below (mparams.devices points into it).
         std::vector<ggml_backend_dev_t> group;
         llama_split_mode                split_mode = LLAMA_SPLIT_MODE_NONE;
 
@@ -364,15 +374,15 @@ std::unique_ptr<orchestrator_pool> orchestrator_make_pool(
             if (spec.devices.size() > 1) {
                 LOG_WRN("%s: [replica %zu] %zu-device split requested but no GPUs found - "
                         "loading a single CPU replica instead\n",
-                        __func__, r, spec.devices.size());
+                        fn, r, spec.devices.size());
             }
         } else {
             // validate every device index in the group before touching mparams.
             for (int dev : spec.devices) {
                 if (dev < 0 || (size_t) dev >= gpus.size()) {
                     LOG_ERR("%s: [replica %zu] requested device %d but only %zu GPU(s) exist\n",
-                            __func__, r, dev, gpus.size());
-                    return nullptr;
+                            fn, r, dev, gpus.size());
+                    return;
                 }
             }
             if (spec.devices.size() == 1) {
@@ -403,21 +413,21 @@ std::unique_ptr<orchestrator_pool> orchestrator_make_pool(
         }
 
         LOG_INF("%s: [replica %zu/%zu] loading on device(s) {%s} from '%s'\n",
-                __func__, r + 1, specs.size(), where.c_str(), params.model.path.c_str());
+                fn, r + 1, specs.size(), where.c_str(), params.model.path.c_str());
 
         // wrap the model immediately so it is freed even if context creation fails.
         llama_model_ptr model(llama_model_load_from_file(params.model.path.c_str(), mparams));
         if (!model) {
             LOG_ERR("%s: [replica %zu] failed to LOAD MODEL ('%s')\n",
-                    __func__, r, params.model.path.c_str());
-            return nullptr; // already-built replicas freed as `pool` unwinds
+                    fn, r, params.model.path.c_str());
+            return;
         }
 
         llama_context_ptr ctx(llama_init_from_model(model.get(), cparams));
         if (!ctx) {
             LOG_ERR("%s: [replica %zu] failed to CREATE CONTEXT (device(s) {%s})\n",
-                    __func__, r, where.c_str());
-            return nullptr; // this model + prior replicas freed on return
+                    fn, r, where.c_str());
+            return;
         }
 
         // watchdog wiring: a heap atomic deadline (stable address) plus an abort callback
@@ -426,25 +436,43 @@ std::unique_ptr<orchestrator_pool> orchestrator_make_pool(
         auto deadline = std::make_unique<std::atomic<int64_t>>(0);
         llama_set_abort_callback(ctx.get(), orchestrator_abort_cb, deadline.get());
 
-        // hand ownership of this loaded model + context to the pool. std::move transfers
-        // the smart pointers (no copying of the model); moving `deadline` keeps the heap
-        // atomic's address stable, so the abort callback's pointer stays valid.
-        orchestrator_pool::impl::replica rep;
+        // publish into this replica's own slot. std::move transfers the smart pointers (no
+        // model copy); moving `deadline` keeps the heap atomic's address stable so the abort
+        // callback's pointer stays valid.
+        orchestrator_pool::impl::replica & rep = p->replicas[r];
         rep.device     = spec.devices[0];
         rep.devices    = spec.devices;
         rep.split_mode = split_mode;
         rep.deadline   = std::move(deadline);
         rep.model      = std::move(model);
         rep.ctx        = std::move(ctx);
-        pool->pimpl->replicas.push_back(std::move(rep));
 
-        LOG_INF("%s: [replica %zu/%zu] OK {%s}\n", __func__, r + 1, specs.size(), where.c_str());
+        ok[r] = 1;
+        LOG_INF("%s: [replica %zu/%zu] OK {%s}\n", fn, r + 1, specs.size(), where.c_str());
+    };
+
+    {
+        std::vector<std::thread> loaders;
+        loaders.reserve(specs.size());
+        for (size_t r = 0; r < specs.size(); ++r) {
+            loaders.emplace_back(build_one, r);
+        }
+        for (auto & t : loaders) {
+            t.join();
+        }
     }
 
-    // every replica loaded; only now start the workers. starting after the build
-    // loop means a pool that failed partway (returned nullptr above) never spawned
-    // a thread, so there is nothing to join on that error path.
-    orchestrator_pool::impl * p = pool->pimpl.get();
+    // all-or-nothing, same contract as the serial version: if any replica failed, discard the
+    // whole pool (the ones that did build are freed as `pool` unwinds; no workers started yet).
+    for (size_t r = 0; r < specs.size(); ++r) {
+        if (!ok[r]) {
+            LOG_ERR("%s: replica %zu failed to build - discarding the pool\n", __func__, r);
+            return nullptr;
+        }
+    }
+
+    // every replica built; only now start the workers (one per replica). starting after the
+    // build means a pool that failed above never spawned a thread - nothing to join on error.
     for (int r = 0; r < (int) p->replicas.size(); ++r) {
         p->workers.emplace_back([p, r] { p->worker_loop(r); });
     }
