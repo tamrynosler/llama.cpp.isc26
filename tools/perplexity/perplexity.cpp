@@ -708,9 +708,14 @@ static results_perplexity perplexity_dp(orchestrator_pool & pool, const common_p
     std::vector<llama_batch> batches(n_rep);
     std::vector<std::vector<std::thread>> rep_workers(n_rep);
     const unsigned hw = std::thread::hardware_concurrency();
+    // split the host cores across replicas: each replica's process_logits pool gets ~cores/n_rep
+    // workers (+1 calling thread), so the N replicas reducing NLL concurrently don't oversubscribe
+    // the CPU. process_logits (host log_softmax over the full vocab) is the bottleneck for
+    // perplexity, so a 4x-oversubscribed pool only adds context-switch + thread-churn overhead.
+    const unsigned per_rep = std::max(1u, (hw > 1 ? hw - 1 : 1) / (unsigned) n_rep);
     for (int r = 0; r < n_rep; ++r) {
         batches[r] = llama_batch_init(std::min(n_batch, n_ctx*n_seq), 0, 1);
-        rep_workers[r].resize(hw > 1 ? hw - 1 : 0);
+        rep_workers[r].resize(per_rep);
     }
 
     // one result slot per chunk, written only by the job that decodes that chunk (distinct slot
