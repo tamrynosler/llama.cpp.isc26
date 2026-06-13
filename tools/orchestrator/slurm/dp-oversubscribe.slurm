@@ -38,14 +38,15 @@ MODELS=(
 )
 
 NUM_DEVICES=4                 # use all 4 GPUs on the node
-REPS_PER_DEVICE=(1 2 3 4)     # sweep replicas/GPU: 1=baseline (4-on-4), 2=8-on-4, 3=12-on-4, 4=16-on-4
-CTX=8192                      # per-replica context (small models -> cheap KV even x R)
+REPS_PER_DEVICE=(1 2 4 6 8 12 16)  # extended sweep to find the plateau (R=1 is the 4-on-4 baseline)
+CTX=16384                     # per-replica context; must hold max(pl)*(pp+tg)=64*256 for pl=64
 NGL=99                        # all layers on GPU
-NBATCH=2048
-UBATCH=512
-PP=128                        # short prompt/gen: this tests concurrency, not long sequences
-TG=64
-PL=1,4,16                     # parallel sequences PER replica (low pl = more GPU idle for stacking)
+NBATCH=4096                   # bigger logical batch (fatter prefill -> better single-replica utilization)
+UBATCH=2048                   # physical micro-batch
+PP=128
+TG=128                        # longer decode -> steadier-state utilization signal
+PL=1,16,64                    # per-replica parallel sequences; high pl pushes a single replica toward
+                              # the GPU roof (shrinks the oversub headroom but lifts absolute t/s)
 # -----------------------------------------------------------------------------
 
 ml gcc cuda
