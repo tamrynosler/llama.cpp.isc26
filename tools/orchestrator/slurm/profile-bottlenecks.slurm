@@ -55,7 +55,7 @@ MODEL="$HOME/models/gemma-2-27b-it-Q8_0.gguf"
 # bartowski splits the Q8 into shards in a subfolder; point at the FIRST shard.
 MODEL_BIG="$HOME/models/Llama-3.3-70B-Instruct-Q8_0/Llama-3.3-70B-Instruct-Q8_0-00001-of-00002.gguf"
 
-WIKI="$REPO/wikitext-2-raw/wiki.test.raw"   # run scripts/get-wikitext-2.sh from $REPO first
+WIKI="$HOME/datasets/wikitext-2-raw/wiki.test.raw"   # run scripts/get-wikitext-2.sh from $REPO first
 
 CTX=2048             # perplexity chunk window (-c)
 NSEQ_HI=8            # batched chunks-per-decode for M1b: -b = CTX*NSEQ_HI
