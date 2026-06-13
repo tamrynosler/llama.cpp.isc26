@@ -61,7 +61,7 @@ PP=512               # prompt length (single value keeps the capacity demo short
 TG=128               # generation length
 PL=1,2,4             # parallel sequences per replica (small: this is a capacity test, not a sweep)
 
-SPLITS=(layer row)   # split strategies to compare; add 'tensor' to also test the experimental mode
+SPLITS=(layer row tensor)   # split strategies to compare; add 'tensor' to also test the experimental mode
 # -----------------------------------------------------------------------------
 
 ml gcc cuda          # pin versions if needed: ml gcc/15.2 cuda/13.1
