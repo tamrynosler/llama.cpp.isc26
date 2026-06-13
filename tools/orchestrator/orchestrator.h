@@ -128,3 +128,23 @@ std::unique_ptr<orchestrator_pool> orchestrator_make_pool(
 // and forwards to the spec-based factory above.
 std::unique_ptr<orchestrator_pool> orchestrator_make_pool(
     common_params & params, const std::vector<int> & devices);
+
+// resolve replica placement from the data-parallel CLI fields into specs, applying the
+// documented precedence (most explicit wins). this is the single point that interprets
+// the --dp-* flags, so every tool builds its pool the same way:
+//   1. dp_device_groups (grouped --dp-devices, e.g. 0+1,2+3) -> one replica per group;
+//      a multi-GPU group is split via dp_split_mode (the model-too-big escape hatch).
+//   2. dp_devices (flat --dp-devices, e.g. 0,0,1,1) -> one pinned replica per entry
+//      (repeats oversubscribe a GPU).
+//   3. dp_num_devices / dp_replicas_per_device -> R replicas on each of GPUs 0..D-1
+//      (count-based oversubscription; R defaults to 1).
+//   4. otherwise n_data_parallel pinned replicas on GPUs 0..N-1 (the default).
+// does not enumerate or validate GPUs (orchestrator_make_pool does that); pure placement arithmetic.
+std::vector<orchestrator_replica_spec> orchestrator_specs_from_params(const common_params & params);
+
+// whether this run should go through the orchestrator instead of the tool's baseline single-context
+// path. true when the --dp-* flags resolve to more than one replica, OR to a single replica that
+// spans multiple GPUs (a model-too-big split, which the baseline path would not apply). a lone
+// single-GPU replica is the trivial case and stays on the baseline path, so --data-parallel 1 and
+// no flags remain byte-identical no-ops.
+bool orchestrator_dp_active(const common_params & params);
