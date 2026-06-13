@@ -23,7 +23,7 @@ static void print_usage(int, char ** argv) {
 
 // ---- data-parallel batched-bench (S10) ----
 // weak scaling: each of N replicas runs the byte-identical single-context benchmark on its own
-// device, concurrently; throughput is aggregated across replicas. n_data_parallel <= 1 never
+// device, concurrently; throughput is aggregated across replicas. a single resolved replica never
 // reaches here, so the baseline path stays byte-for-byte unchanged.
 
 // single-use barrier (std::barrier is C++20; this tree targets C++17). submitting exactly n_rep
@@ -97,14 +97,6 @@ static int batched_bench_dp(common_params & params) {
     const std::vector<int> n_tg = params.n_tg;
     const std::vector<int> n_pl = params.n_pl;
 
-    // resolve replica placement (consumer policy, mirrors the S9 perplexity path): explicit
-    // --dp-devices wins; otherwise pin replicas to GPUs 0..N-1.
-    std::vector<int> dp_devices = params.dp_devices;
-    if (dp_devices.empty()) {
-        for (int i = 0; i < params.n_data_parallel; ++i) {
-            dp_devices.push_back(i);
-        }
-    }
     // warn, don't override (matches the -sm/-mg convention): a data-parallel run wants weights on
     // GPU, but we never silently change a value the user may have set.
     if (params.n_gpu_layers == -1) {
@@ -116,7 +108,8 @@ static int batched_bench_dp(common_params & params) {
     // pool sizes n_seq_max from params.n_parallel (see orchestrator.h), so set it before building.
     params.n_parallel = n_pl.empty() ? 1 : *std::max_element(n_pl.begin(), n_pl.end());
 
-    auto pool = orchestrator_make_pool(params, dp_devices);
+    // resolve replica placement from the --dp-* flags (precedence in orchestrator_specs_from_params).
+    auto pool = orchestrator_make_pool(params, orchestrator_specs_from_params(params));
     if (!pool) {
         LOG_ERR("%s: failed to build the data-parallel replica pool\n", __func__);
         return 1;
@@ -378,8 +371,10 @@ int llama_batched_bench(int argc, char ** argv) {
     llama_numa_init(params.numa);
 
     // data-parallel path (S10): n replicas run the benchmark concurrently, throughput aggregated.
-    // dp <= 1 falls through to the unchanged single-context path below.
-    if (params.n_data_parallel > 1) {
+    // active when the --dp-* flags resolve to a non-trivial placement (more than one replica, or a
+    // single replica split across >1 GPU); a lone single-GPU replica falls through to the unchanged
+    // single-context path below.
+    if (orchestrator_dp_active(params)) {
         const int rc = batched_bench_dp(params);
         llama_backend_free();
         return rc;

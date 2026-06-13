@@ -2240,7 +2240,7 @@ int llama_perplexity(int argc, char ** argv) {
     // ---- data-parallel path (S9) ----
     // only the plain perplexity path is wired for DP; other scoring modes, strided PPL, and
     // logits-file streaming fall back to the single-replica path below with a warning.
-    if (params.n_data_parallel > 1) {
+    if (orchestrator_dp_active(params)) {
         const bool dp_eligible =
             !params.hellaswag && !params.winogrande && !params.multiple_choice &&
             !params.kl_divergence && params.ppl_stride <= 0 && params.logits_file.empty();
@@ -2249,14 +2249,6 @@ int llama_perplexity(int argc, char ** argv) {
             // sequences, n_ctx = n_parallel * (per-chunk n_ctx). Each replica is one such context and
             // stacks n_parallel chunks per llama_decode - the batch size (-b) controls it.
 
-            // resolve placement (the S8-deferred consumer policy): explicit --dp-devices wins;
-            // otherwise pin replicas to GPUs 0..N-1.
-            std::vector<int> dp_devices = params.dp_devices;
-            if (dp_devices.empty()) {
-                for (int i = 0; i < params.n_data_parallel; ++i) {
-                    dp_devices.push_back(i);
-                }
-            }
             // warn, don't override (matches the -sm/-mg convention): a data-parallel run wants
             // weights on GPU, but we never silently change a value the user may have set.
             if (params.n_gpu_layers == -1) {
@@ -2264,7 +2256,8 @@ int llama_perplexity(int argc, char ** argv) {
                         "on GPU (a CPU-only data-parallel run will be slow)\n", __func__);
             }
 
-            auto pool = orchestrator_make_pool(params, dp_devices);
+            // resolve replica placement from the --dp-* flags (precedence in orchestrator_specs_from_params).
+            auto pool = orchestrator_make_pool(params, orchestrator_specs_from_params(params));
             if (!pool) {
                 LOG_ERR("%s: failed to build the data-parallel replica pool\n", __func__);
                 llama_backend_free();

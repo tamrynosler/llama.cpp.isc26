@@ -495,3 +495,63 @@ std::unique_ptr<orchestrator_pool> orchestrator_make_pool(
     }
     return orchestrator_make_pool(params, specs);
 }
+
+// resolve the --dp-* placement fields into specs (precedence documented in the header).
+// pure arithmetic over the parsed flags; GPU enumeration/validation happens in make_pool.
+std::vector<orchestrator_replica_spec> orchestrator_specs_from_params(const common_params & params) {
+    std::vector<orchestrator_replica_spec> specs;
+
+    // 1. explicit grouped placement (model-too-big split). most explicit -> wins.
+    if (!params.dp_device_groups.empty()) {
+        for (const auto & group : params.dp_device_groups) {
+            orchestrator_replica_spec s;
+            s.devices    = group;
+            s.split_mode = group.size() > 1 ? params.dp_split_mode : LLAMA_SPLIT_MODE_NONE;
+            specs.push_back(std::move(s));
+        }
+        return specs;
+    }
+
+    // 2. explicit flat placement (pinned / oversubscription).
+    if (!params.dp_devices.empty()) {
+        for (int dev : params.dp_devices) {
+            orchestrator_replica_spec s;
+            s.devices = { dev };
+            specs.push_back(std::move(s));
+        }
+        return specs;
+    }
+
+    // 3. count-based placement: R replicas on each of GPUs 0..D-1.
+    if (params.dp_num_devices > 0 || params.dp_replicas_per_device > 0) {
+        const int n_dev = params.dp_num_devices > 0 ? params.dp_num_devices : params.n_data_parallel;
+        const int per   = params.dp_replicas_per_device > 0 ? params.dp_replicas_per_device : 1;
+        for (int d = 0; d < n_dev; ++d) {
+            for (int r = 0; r < per; ++r) {
+                orchestrator_replica_spec s;
+                s.devices = { d };
+                specs.push_back(std::move(s));
+            }
+        }
+        return specs;
+    }
+
+    // 4. default: n_data_parallel pinned replicas on GPUs 0..N-1.
+    for (int i = 0; i < params.n_data_parallel; ++i) {
+        orchestrator_replica_spec s;
+        s.devices = { i };
+        specs.push_back(std::move(s));
+    }
+    return specs;
+}
+
+// route through the orchestrator when the placement is non-trivial: >1 replica, or a single replica
+// spanning >1 GPU (a model-too-big split the baseline path would ignore). a lone single-GPU replica
+// stays baseline, keeping --data-parallel 1 / no flags byte-identical no-ops.
+bool orchestrator_dp_active(const common_params & params) {
+    const auto specs = orchestrator_specs_from_params(params);
+    if (specs.size() > 1) {
+        return true;
+    }
+    return specs.size() == 1 && specs.front().devices.size() > 1;
+}
