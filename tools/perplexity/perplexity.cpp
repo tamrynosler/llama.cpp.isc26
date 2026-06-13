@@ -22,9 +22,31 @@
 #include <thread>
 #include <vector>
 
+#if defined(__linux__)
+#include <sched.h>
+#endif
+
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267) // possible loss of data
 #endif
+
+// Number of CPUs actually available to this process. On a shared HPC node
+// std::thread::hardware_concurrency() reports the whole node, not the SLURM/
+// cgroup allocation, so sizing worker pools from it oversubscribes badly (e.g.
+// 112 threads on a 16-core allocation). Prefer the process affinity mask.
+static unsigned int usable_cpu_count() {
+#if defined(__linux__)
+    cpu_set_t set;
+    if (sched_getaffinity(0, sizeof(set), &set) == 0) {
+        const int n = CPU_COUNT(&set);
+        if (n > 0) {
+            return (unsigned int) n;
+        }
+    }
+#endif
+    const unsigned int n = std::thread::hardware_concurrency();
+    return n ? n : 1;
+}
 
 struct results_perplexity {
     std::vector<llama_token> tokens;
@@ -518,7 +540,7 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
 
     LOG_INF("%s: calculating perplexity over %d chunks, n_ctx=%d, batch_size=%d, n_seq=%d\n", __func__, n_chunk, n_ctx, n_batch, n_seq);
 
-    std::vector<std::thread> workers(std::thread::hardware_concurrency() - 1);
+    std::vector<std::thread> workers(usable_cpu_count() - 1);
 
     std::vector<uint16_t> log_probs;
     if (!params.logits_file.empty()) {
@@ -738,7 +760,7 @@ static results_perplexity perplexity_dp(orchestrator_pool & pool, const common_p
     // slot, so this is race-free without locking (the pool already serializes access to each ctx).
     std::vector<llama_batch> batches(n_rep);
     std::vector<std::vector<std::thread>> rep_workers(n_rep);
-    const unsigned hw = std::thread::hardware_concurrency();
+    const unsigned hw = usable_cpu_count();
     // split the host cores across replicas: each replica's process_logits pool gets ~cores/n_rep
     // workers (+1 calling thread), so the N replicas reducing NLL concurrently don't oversubscribe
     // the CPU. process_logits (host log_softmax over the full vocab) is the bottleneck for
@@ -1095,7 +1117,7 @@ static void hellaswag_score(llama_context * ctx, const common_params & params) {
 
     std::vector<std::pair<size_t, llama_token>> eval_pairs;
     std::vector<float> eval_results;
-    std::vector<std::thread> workers(std::thread::hardware_concurrency());
+    std::vector<std::thread> workers(usable_cpu_count());
 
     for (size_t i0 = 0; i0 < hs_task_count; i0++) {
         int n_cur = 0;
@@ -1393,7 +1415,7 @@ static void winogrande_score(llama_context * ctx, const common_params & params) 
 
     std::vector<std::pair<size_t, llama_token>> eval_pairs;
     std::vector<float> eval_results;
-    std::vector<std::thread> workers(std::thread::hardware_concurrency());
+    std::vector<std::thread> workers(usable_cpu_count());
 
     int n_correct = 0;
     int n_done    = 0;
@@ -1700,7 +1722,7 @@ static void multiple_choice_score(llama_context * ctx, const common_params & par
                 }
             }
         };
-        size_t max_thread = std::thread::hardware_concurrency();
+        size_t max_thread = usable_cpu_count();
         max_thread = std::min(max_thread, (tasks.size() + K_TOKEN_CHUNK - 1)/K_TOKEN_CHUNK);
         std::vector<std::thread> workers(max_thread-1);
         for (auto& w : workers) w = std::thread(prepare);
@@ -1746,7 +1768,7 @@ static void multiple_choice_score(llama_context * ctx, const common_params & par
 
     std::vector<std::pair<size_t, llama_token>> eval_pairs;
     std::vector<float> eval_results;
-    std::vector<std::thread> workers(std::thread::hardware_concurrency());
+    std::vector<std::thread> workers(usable_cpu_count());
     std::vector<int> batch_indeces;
 
     int n_done = 0;
@@ -1986,7 +2008,7 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
 
     LOG_INF("%s: computing over %d chunks, n_ctx=%u, batch_size=%d, n_seq=%d\n", __func__, n_chunk, n_ctx, n_batch, n_seq);
 
-    std::vector<std::thread> workers(std::thread::hardware_concurrency() - 1);
+    std::vector<std::thread> workers(usable_cpu_count() - 1);
 
     auto mean_and_uncertainty = [] (double sum, double sum2, size_t count) {
         if (count < 1) {
