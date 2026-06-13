@@ -12,6 +12,7 @@
 #include <clocale>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <fstream>
@@ -542,6 +543,15 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
     // process the entire prompt.
     const int first = n_ctx/2;
 
+    // Optional host-side profiling: split per-chunk wall-clock into GPU decode
+    // vs CPU logit post-processing, to verify whether the CPU pass is actually
+    // a meaningful fraction before optimising it. Enabled by setting the env
+    // var LLAMA_PPL_PROFILE (to any value). Off by default; when on it only adds
+    // an llama_synchronize + timing per chunk, so it cannot change the PPL.
+    const bool ppl_profile = std::getenv("LLAMA_PPL_PROFILE") != nullptr;
+    double prof_decode_s   = 0.0;
+    double prof_postproc_s = 0.0;
+
     for (int i = 0; i < n_chunk; i += n_seq) {
         const int start =     i * n_ctx;
         const int end   = start + n_ctx;
@@ -598,6 +608,13 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
             }
         }
 
+        if (ppl_profile) {
+            // attribute GPU decode time for this chunk (t_start was taken at the
+            // top of the iteration, just before the KV clear + decode batches).
+            llama_synchronize(ctx);
+            prof_decode_s += std::chrono::duration<double>(
+                std::chrono::high_resolution_clock::now() - t_start).count();
+        }
 
         if (i == 0) {
             llama_synchronize(ctx);
@@ -611,6 +628,8 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
             }
             LOG("%.2f minutes\n", total_seconds / 60.0);
         }
+
+        const auto t_pp0 = std::chrono::high_resolution_clock::now();
 
         for (int seq = 0; seq < n_seq_batch; seq++) {
             const float * all_logits = num_batches > 1 ? logits.data() : llama_get_logits_ith(ctx, seq*n_ctx + first);
@@ -642,9 +661,21 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
             }
         }
 
+        if (ppl_profile) {
+            prof_postproc_s += std::chrono::duration<double>(
+                std::chrono::high_resolution_clock::now() - t_pp0).count();
+        }
+
         logits.clear();
     }
     LOG("\n");
+
+    if (ppl_profile) {
+        const double t_sum = prof_decode_s + prof_postproc_s;
+        LOG_INF("%s: [profile] GPU decode = %.3fs (%.1f%%), CPU post-proc = %.3fs (%.1f%%) over %d chunks\n",
+                __func__, prof_decode_s, t_sum > 0.0 ? 100.0*prof_decode_s/t_sum : 0.0,
+                prof_postproc_s, t_sum > 0.0 ? 100.0*prof_postproc_s/t_sum : 0.0, count > 0 ? n_chunk : 0);
+    }
 
     nll2 /= count;
     nll /= count;
