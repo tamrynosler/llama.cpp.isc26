@@ -574,6 +574,146 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
     double prof_decode_s   = 0.0;
     double prof_postproc_s = 0.0;
 
+    // P5: overlap each chunk's CPU log-softmax post-processing with the GPU
+    // decode of the NEXT chunk (double-buffered logits), so the GPU is not idle
+    // during the host NLL pass. Opt-in via the env var LLAMA_PPL_OVERLAP; off by
+    // default so the proven serial path is untouched. Limited to the common
+    // single-batch case (num_batches == 1) and the normal (non --logits-file)
+    // path; otherwise the serial path below runs unchanged. Costs two extra
+    // host-side logit buffers (~2 x (n_ctx-first) x n_vocab floats).
+    const bool ppl_overlap = std::getenv("LLAMA_PPL_OVERLAP") != nullptr
+                             && num_batches == 1 && params.logits_file.empty();
+
+    // Per-seq logit post-processing (NLL accumulation + running-PPL log). Shared
+    // by the serial and overlap paths so they stay byte-for-byte equivalent.
+    auto process_seq = [&](int ci, int seq, const float * all_logits) {
+        const int cstart = ci * n_ctx;
+        llama_token * tokens_data = tokens.data() + cstart + seq*n_ctx + first;
+        if (!params.logits_file.empty()) {
+            process_logits(logits_stream, n_vocab, all_logits,
+                    tokens_data, n_ctx - 1 - first,
+                    workers, log_probs, nll, nll2);
+        } else {
+            process_logits(n_vocab, all_logits,
+                    tokens_data, n_ctx - 1 - first,
+                    workers, nll, nll2,
+                    logit_history.data() + cstart + seq*n_ctx + first,
+                    prob_history.data()  + cstart + seq*n_ctx + first);
+        }
+        count += n_ctx - first - 1;
+
+        // perplexity is e^(average negative log-likelihood)
+        if (params.ppl_output_type == 0) {
+            LOG("[%d]%.4lf,", ci + seq + 1, std::exp(nll / count));
+        } else {
+            double av = nll/count;
+            double av2 = nll2/count - av*av;
+            if (av2 > 0) {
+                av2 = sqrt(av2/(count-1));
+            }
+            LOG("%8d  %.4lf  %4lf  %4lf\n", ci*n_ctx, std::exp(nll / count), av, av2);
+        }
+    };
+
+    if (ppl_overlap) {
+        // Fill the batch for chunk `ci` (a single sub-batch, since num_batches==1)
+        // and decode it WITHOUT synchronising, so the GPU can run it while the CPU
+        // post-processes the previous chunk. Mirrors the serial batch fill exactly.
+        auto decode_chunk = [&](int ci) -> bool {
+            const int cstart = ci * n_ctx;
+            const int nsb    = std::min(n_seq, n_chunk - ci);
+            llama_memory_clear(llama_get_memory(ctx), true);
+            batch.n_tokens = 0;
+            for (int seq = 0; seq < nsb; seq++) {
+                const int seq_start = cstart + seq*n_ctx;
+                const auto token_org = tokens[seq_start];
+                if (add_bos) {
+                    tokens[seq_start] = llama_vocab_bos(vocab);
+                }
+                for (int k = 0; k < n_ctx; ++k) {
+                    const int idx = seq*n_ctx + k;
+                    batch.token   [idx]    = tokens[seq_start + k];
+                    batch.pos     [idx]    = k;
+                    batch.n_seq_id[idx]    = 1;
+                    batch.seq_id  [idx][0] = seq;
+                    batch.logits  [idx]    = k >= first ? 1 : 0;
+                }
+                batch.n_tokens += n_ctx;
+                tokens[seq_start] = token_org;
+            }
+            return llama_decode(ctx, batch) == 0;
+        };
+
+        // Copy chunk `ci`'s output-window logits out of the context (this read is
+        // the synchronisation point) so the next decode can overwrite them safely.
+        const size_t rows = (size_t)(n_ctx - first);
+        auto copy_chunk_logits = [&](int ci, std::vector<float> & dst) {
+            const int nsb = std::min(n_seq, n_chunk - ci);
+            dst.resize(rows * (size_t) n_vocab * nsb);
+            for (int seq = 0; seq < nsb; seq++) {
+                const float * src = llama_get_logits_ith(ctx, seq*n_ctx + first);
+                std::copy(src, src + rows * (size_t) n_vocab,
+                          dst.data() + (size_t) seq * rows * (size_t) n_vocab);
+            }
+        };
+
+        std::vector<float> buf[2];
+        int cur = 0;
+
+        if (!decode_chunk(0)) {
+            LOG_INF("%s : failed to decode\n", __func__);
+            return {tokens, -1, logit_history, prob_history};
+        }
+        copy_chunk_logits(0, buf[cur]);
+
+        for (int i = 0; i < n_chunk; i += n_seq) {
+            const int  nxt     = i + n_seq;
+            const auto t_start = std::chrono::high_resolution_clock::now();
+
+            // issue the next chunk's decode; the GPU runs it while the CPU below
+            // post-processes the current chunk's already-copied logits.
+            if (nxt < n_chunk) {
+                if (!decode_chunk(nxt)) {
+                    LOG_INF("%s : failed to decode\n", __func__);
+                    return {tokens, -1, logit_history, prob_history};
+                }
+            }
+
+            const int  n_seq_batch = std::min(n_seq, n_chunk - i);
+            const auto t_pp0       = std::chrono::high_resolution_clock::now();
+            for (int seq = 0; seq < n_seq_batch; seq++) {
+                process_seq(i, seq, buf[cur].data() + (size_t) seq * rows * (size_t) n_vocab);
+            }
+            if (ppl_profile) {
+                prof_postproc_s += std::chrono::duration<double>(
+                    std::chrono::high_resolution_clock::now() - t_pp0).count();
+            }
+
+            // harvest the next chunk; with overlap working most of its decode
+            // already completed during the post-proc above, so this waits little.
+            if (nxt < n_chunk) {
+                const auto t_h0 = std::chrono::high_resolution_clock::now();
+                copy_chunk_logits(nxt, buf[1 - cur]);
+                cur ^= 1;
+                if (ppl_profile) {
+                    prof_decode_s += std::chrono::duration<double>(
+                        std::chrono::high_resolution_clock::now() - t_h0).count();
+                }
+            }
+
+            if (i == 0) {
+                const float t_total = std::chrono::duration<float>(
+                    std::chrono::high_resolution_clock::now() - t_start).count();
+                LOG_INF("%s: %.2f seconds per pass - ETA ", __func__, t_total);
+                int total_seconds = (int)(t_total*n_chunk/n_seq);
+                if (total_seconds >= 60*60) {
+                    LOG("%d hours ", total_seconds / (60*60));
+                    total_seconds = total_seconds % (60*60);
+                }
+                LOG("%.2f minutes\n", total_seconds / 60.0);
+            }
+        }
+    } else {
     for (int i = 0; i < n_chunk; i += n_seq) {
         const int start =     i * n_ctx;
         const int end   = start + n_ctx;
@@ -655,32 +795,7 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
 
         for (int seq = 0; seq < n_seq_batch; seq++) {
             const float * all_logits = num_batches > 1 ? logits.data() : llama_get_logits_ith(ctx, seq*n_ctx + first);
-
-            llama_token * tokens_data = tokens.data() + start + seq*n_ctx + first;
-            if (!params.logits_file.empty()) {
-                process_logits(logits_stream, n_vocab, all_logits,
-                        tokens_data, n_ctx - 1 - first,
-                        workers, log_probs, nll, nll2);
-            } else {
-                process_logits(n_vocab, all_logits,
-                        tokens_data, n_ctx - 1 - first,
-                        workers, nll, nll2,
-                        logit_history.data() + start + seq*n_ctx + first,
-                        prob_history.data()  + start + seq*n_ctx + first);
-            }
-            count += n_ctx - first - 1;
-
-            // perplexity is e^(average negative log-likelihood)
-            if (params.ppl_output_type == 0) {
-                LOG("[%d]%.4lf,", i + seq + 1, std::exp(nll / count));
-            } else {
-                double av = nll/count;
-                double av2 = nll2/count - av*av;
-                if (av2 > 0) {
-                    av2 = sqrt(av2/(count-1));
-                }
-                LOG("%8d  %.4lf  %4lf  %4lf\n", i*n_ctx, std::exp(nll / count), av, av2);
-            }
+            process_seq(i, seq, all_logits);
         }
 
         if (ppl_profile) {
@@ -689,6 +804,7 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
         }
 
         logits.clear();
+    }
     }
     LOG("\n");
 
