@@ -18,7 +18,10 @@
 # inconclusive for decode and relies on the B spin-loop test for the mechanism).
 #
 # Cluster notes: NO GRES - select the GPU with CUDA_VISIBLE_DEVICES. Modules via lmod. The smoke
-# target is gated on -DLLAMA_BUILD_TESTS=ON, so build that target explicitly (below).
+# target is gated on -DLLAMA_BUILD_TESTS=ON, so build it ONCE on a login/interactive node first
+# (this batch job only runs the pre-built binary, like the other scripts):
+#   cmake -B build -DGGML_CUDA=ON -DLLAMA_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release
+#   cmake --build build --target llama-orchestrator-smoke -j$(nproc)
 #
 # Usage:
 #   sbatch tools/orchestrator/slurm/dp-watchdog.slurm
@@ -37,9 +40,14 @@ nvidia-smi -L 2>/dev/null || true
 ( cd "$REPO" && echo "fork commit: $(git rev-parse --short HEAD 2>/dev/null)" ) || true
 echo
 
-# build the smoke target (needs LLAMA_BUILD_TESTS=ON; re-running cmake is cheap if already configured)
-( cd "$REPO" && cmake -B build -DGGML_CUDA=ON -DLLAMA_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release >/dev/null \
-  && cmake --build build --target llama-orchestrator-smoke -j"$(nproc)" ) || { echo "BUILD FAILED"; exit 1; }
+# expects a pre-built smoke binary (build it once on a login node - see header). this batch job
+# only RUNS it, so the build environment / cmake module is not needed here.
+if [ ! -x "$SMOKE" ]; then
+  echo "smoke binary not found at $SMOKE"
+  echo "build it once with: cmake -B build -DGGML_CUDA=ON -DLLAMA_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release"
+  echo "                    cmake --build build --target llama-orchestrator-smoke -j\$(nproc)"
+  exit 1
+fi
 
 export CUDA_VISIBLE_DEVICES=0   # one H100 is enough; "0,0" = two replicas on it
 
