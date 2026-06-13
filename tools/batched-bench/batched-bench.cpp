@@ -198,6 +198,31 @@ static int batched_bench_dp(common_params & params) {
                     llama_batch & batch = batches[rr];
                     const auto    rand_tok = [&]() -> llama_token { return (llama_token) (rngs[rr]() % n_vocab); };
 
+                    // B1: per-shape warmup (untimed) so one-time GPU costs for this
+                    // (pp,tg,pl) shape don't land in the timed measurement. Each replica
+                    // warms its own context; KV is reset by the timed section below.
+                    {
+                        common_batch_clear(batch);
+                        for (int j = 0; j < (is_pp_shared ? 1 : pl); ++j) {
+                            for (int i = 0; i < pp; ++i) {
+                                common_batch_add(batch, rand_tok(), i, { j }, i == pp - 1);
+                            }
+                        }
+                        llama_memory_clear(mem, false);
+                        if (!bb_decode_helper(ctx, batch, n_batch, true)) {
+                            return false;
+                        }
+                        for (int i = 0; i < (tg < 2 ? tg : 2); ++i) {
+                            common_batch_clear(batch);
+                            for (int j = 0; j < pl; ++j) {
+                                common_batch_add(batch, rand_tok(), pp + i, { j }, true);
+                            }
+                            if (!bb_decode_helper(ctx, batch, n_batch, true)) {
+                                return false;
+                            }
+                        }
+                    }
+
                     common_batch_clear(batch);
                     for (int j = 0; j < (is_pp_shared ? 1 : pl); ++j) {
                         for (int i = 0; i < pp; ++i) {
@@ -479,6 +504,39 @@ int llama_batched_bench(int argc, char ** argv) {
 
                 if (n_ctx_req > n_kv_max) {
                     continue;
+                }
+
+                // B1: per-shape warmup. Run one throwaway PP (+ a couple TG steps) at
+                // THIS (pp,tg,pl) shape, untimed, so one-time GPU costs (CUDA graph
+                // capture, cuBLASLt heuristics, workspace alloc) for the shape don't
+                // land inside the first timed cell that uses it. KV is reset by the
+                // timed section's llama_memory_clear below.
+                {
+                    common_batch_clear(batch);
+                    for (int j = 0; j < (is_pp_shared ? 1 : pl); ++j) {
+                        for (int i = 0; i < pp; ++i) {
+                            common_batch_add(batch, get_token_rand(), i, { j }, i == pp - 1);
+                        }
+                    }
+                    llama_memory_clear(mem, false);
+                    if (!decode_helper(ctx, batch, ctx_params.n_batch, true)) {
+                        LOG_ERR("%s: llama_decode() failed\n", __func__);
+                        llama_free(ctx);
+                        llama_model_free(model);
+                        return 1;
+                    }
+                    for (int i = 0; i < (tg < 2 ? tg : 2); ++i) {
+                        common_batch_clear(batch);
+                        for (int j = 0; j < pl; ++j) {
+                            common_batch_add(batch, get_token_rand(), pp + i, { j }, true);
+                        }
+                        if (!decode_helper(ctx, batch, ctx_params.n_batch, true)) {
+                            LOG_ERR("%s: llama_decode() failed\n", __func__);
+                            llama_free(ctx);
+                            llama_model_free(model);
+                            return 1;
+                        }
+                    }
                 }
 
                 common_batch_clear(batch);
