@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=bb-dp-cluster
+#SBATCH --partition=workers
 #SBATCH --nodes=2
 #SBATCH --nodelist=cn001,cn002
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=64
 #SBATCH --time=02:00:00
 #SBATCH --output=bb-dp-cluster-%j.log
+#
+# PARTITION: cn001 lives only in the 'workers' partition (the default 'workers_not_build'
+# holds cn[002-003] only), so a 2-node run touching cn001 MUST use --partition=workers.
+# cn001 must also be free (not held by an interactive allocation) for this to schedule.
 #
 # C++-NATIVE cross-node data-parallel batched-bench (S19 Phase 2). This replaces the srun+python
 # prototype (dp-multinode-srun.slurm + aggregate-multinode.py, job 453): coordination + aggregation
@@ -68,6 +73,18 @@ echo
 
 # each node selects its 4 local GPUs (CUDA_VISIBLE_DEVICES is per-node-local; srun propagates env).
 export CUDA_VISIBLE_DEVICES=0,1,2,3
+
+# pre-flight: confirm the srun<->HPC-X pmix handshake before the (long) sweep. Cheap (no model);
+# only runs if the test binary was built (-DLLAMA_BUILD_TESTS=ON). Fails the job fast on a bad PMI.
+PREFLIGHT="$REPO/build-mpi/bin/llama-orchestrator-cluster-test"
+if [[ -x "$PREFLIGHT" ]]; then
+  echo "=== pmix pre-flight: cluster_link on ${SLURM_NNODES:-2} nodes (--mpi=$MPI_PMI) ==="
+  if ! srun --mpi="$MPI_PMI" --nodes="${SLURM_NNODES:-2}" --ntasks-per-node=1 "$PREFLIGHT"; then
+    echo "FATAL: cluster_link pre-flight failed under --mpi=$MPI_PMI; try MPI_PMI=pmi2." >&2
+    exit 1
+  fi
+  echo
+fi
 
 # run <label> <logfile> <command...> - capture full output, echo the cluster table rows.
 run() {
