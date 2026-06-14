@@ -44,6 +44,12 @@ DMIN=2                # --spec-draft-n-min
 N_PREDICT=256         # tokens to generate per stream
 PROMPT_CHARS=4096     # bytes sliced from the dataset for the prompt (same prompt on every replica)
 DP=4                  # replicas (one target+draft pair per GPU)
+SEED=42               # FIXED seed: with the same seed on the baseline and every replica, the spec
+                      # decode is deterministic, so all replicas run the IDENTICAL stream (same prompt
+                      # + same sampling). that makes weak scaling clean: each replica == the 1-GPU
+                      # baseline (acceptance%, n_accept), and the aggregate is a true ~DPx. Without a
+                      # fixed seed each replica samples independently -> acceptance/work vary per replica
+                      # and the slowest replica caps the max-span aggregate, hiding the clean multiple.
 
 CTX=8192
 BATCH=2048
@@ -91,7 +97,7 @@ for pair in "${SPEC_PAIRS[@]}"; do
   for dmax in "${DMAX_SWEEP[@]}"; do
     common=( -m "$MODELS_DIR/$target" -md "$MODELS_DIR/$draft"
              -c "$CTX" -b "$BATCH" -ub "$UBATCH" -ngl "$NGL" -ngld "$NGLD"
-             -ctk "$CTK" -ctv "$CTV"
+             -ctk "$CTK" -ctv "$CTV" -s "$SEED"
              --spec-draft-n-max "$dmax" --spec-draft-n-min "$DMIN"
              -n "$N_PREDICT" -f "$PROMPT_FILE" )
 
@@ -110,6 +116,8 @@ for pair in "${SPEC_PAIRS[@]}"; do
 done
 
 echo "done -> $RESULTS"
-echo "verify: per (pair,dmax), the DP 'ALL' row decode t/s should be ~${DP}x the 1-GPU 'decoded ... t/s',"
-echo "        with each replica's n_accept and accept% matching the 1-GPU run (spec speedup preserved,"
-echo "        then multiplied by replica count). acceptance% is set by the model pair + dmax, not by DP."
+echo "verify: per (pair,dmax), the DP 'ALL' decode t/s should be ~${DP}x the 1-GPU 'decoded ... t/s',"
+echo "        and with the fixed seed each replica's n_accept / accept% should match the 1-GPU run"
+echo "        (modulo tiny GPU FP nondeterminism). compare the 'ALL' decode t/s (max-span, generation"
+echo "        phase only - apples-to-apples with the baseline). the separate 'aggregate decode ... e2e'"
+echo "        line is lower because it includes the prompt encode + per-replica finish skew."
