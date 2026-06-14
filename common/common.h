@@ -469,6 +469,11 @@ struct common_params {
     // count-based placement (alternative to listing devices): R replicas on each of GPUs 0..D-1.
     int32_t dp_num_devices         = 0; // D; 0 = unset
     int32_t dp_replicas_per_device = 0; // R; 0 = unset (treated as 1 when D is set)
+    // data-parallel speculative-decode mode (consumed by llama-speculative):
+    bool    dp_weak       = false; // weak scaling: every replica runs the IDENTICAL stream (diagnostic);
+                                   // default is strong scaling (distinct corpus shards per replica)
+    int32_t dp_chunk_chars = 0;    // strong scaling: bytes per corpus shard; >0 also engages the batch
+                                   // path at any replica count (so -dp 1 gives the serial baseline)
 
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;

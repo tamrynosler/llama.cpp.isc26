@@ -7,13 +7,17 @@
 #SBATCH --time=02:00:00
 #SBATCH --output=dp-spec-%j.log
 #
-# Data-parallel SPECULATIVE decoding: combine the speculative-decoding speedup with the orchestrator's
-# replica speedup. For each (target, draft) pair and draft length, compare:
-#   (A) 1 GPU,  single spec stream (no -dp)        -> baseline decode tok/s + acceptance%
-#   (B) 4 GPUs, -dp 4 (one target+draft per GPU)   -> ALL-row aggregate decode tok/s (weak scaling)
-# Each of the 4 replicas runs the byte-identical single-stream spec decode on the SAME prompt
-# concurrently, so the aggregate decode t/s should approach 4x the 1-GPU number with acceptance% and
-# n_accept/replica UNCHANGED (the spec speedup is preserved, then multiplied by the replica count).
+# Data-parallel SPECULATIVE decoding, STRONG scaling (the real-work metric): a corpus is sliced into M
+# DISTINCT prompts and processed across the replicas - NOT the same prompt duplicated. For each
+# (target, draft) pair + draft length, compare:
+#   (A) 1 GPU,  -dp 1 --dp-chunk-chars C  -> serial baseline: all M prompts on one GPU (wall = T1)
+#   (B) 4 GPUs, -dp 4 --dp-chunk-chars C  -> work-stealing across 4 (target+draft) pairs (wall = T4)
+# REAL speedup = T1 / T4 (how much faster 4 GPUs chew through the SAME distinct workload). This is the
+# offline-batch story: split the dataset, process the shards in parallel. The spec speedup is inside
+# each stream; DP multiplies the batch throughput.
+#
+# (For the identical-stream scaling-efficiency diagnostic, add --dp-weak instead - see RESULTS.md
+# 2026-06-14; it is NOT a real-work throughput number and is not run here.)
 #
 # Single-node DP needs NO MPI (the orchestrator lib is always built). Build the fork once:
 #   ml gcc cuda
@@ -39,17 +43,15 @@ SPEC_PAIRS=(
   "Qwen2.5-72B-Instruct-Q4_K_M.gguf|qwen2.5-0.5b-instruct-q4_k_m.gguf|72B+0.5B"
   "Qwen2.5-72B-Instruct-Q4_K_M.gguf|Qwen2.5-7B-Instruct-Q4_K_M.gguf|72B+7B"
 )
-DMAX_SWEEP=(4 8 16)   # --spec-draft-n-max values to sweep (tokens drafted per step); 0 = no draft, skipped
+DMAX_SWEEP=(4 8 16)   # --spec-draft-n-max values to sweep (tokens drafted per step)
 DMIN=2                # --spec-draft-n-min
-N_PREDICT=256         # tokens to generate per stream
-PROMPT_CHARS=4096     # bytes sliced from the dataset for the prompt (same prompt on every replica)
+N_PREDICT=256         # tokens generated per prompt
 DP=4                  # replicas (one target+draft pair per GPU)
-SEED=42               # FIXED seed: with the same seed on the baseline and every replica, the spec
-                      # decode is deterministic, so all replicas run the IDENTICAL stream (same prompt
-                      # + same sampling). that makes weak scaling clean: each replica == the 1-GPU
-                      # baseline (acceptance%, n_accept), and the aggregate is a true ~DPx. Without a
-                      # fixed seed each replica samples independently -> acceptance/work vary per replica
-                      # and the slowest replica caps the max-span aggregate, hiding the clean multiple.
+SEED=42               # fixed seed (reproducible; distinct prompts still diverge - that's the point)
+
+CHUNK_CHARS=4096      # bytes per shard -> one distinct prompt each (~the old single-prompt size)
+NUM_CHUNKS=16         # M distinct prompts sliced from the dataset (16 across 4 GPUs = 4 each)
+CORPUS_CHARS=$(( CHUNK_CHARS * NUM_CHUNKS ))
 
 CTX=8192
 BATCH=2048
@@ -65,30 +67,33 @@ ml gcc cuda           # pin if needed: ml gcc/15.2 cuda/13.3
 RESULTS="$REPO/results/dp-spec-${SLURM_JOB_ID:-local}"
 mkdir -p "$RESULTS"
 
-# slice a prompt from the dataset (no separate file needed); same prompt feeds every replica.
-PROMPT_FILE="$(mktemp /tmp/dp_spec_prompt_XXXX.txt)"
-head -c "$PROMPT_CHARS" "$DATASET" > "$PROMPT_FILE"
-trap 'rm -f "$PROMPT_FILE"' EXIT
+# slice a CORPUS from the dataset; the tool slices it into NUM_CHUNKS distinct prompts of CHUNK_CHARS.
+CORPUS_FILE="$(mktemp /tmp/dp_spec_corpus_XXXX.txt)"
+head -c "$CORPUS_CHARS" "$DATASET" > "$CORPUS_FILE"
+trap 'rm -f "$CORPUS_FILE"' EXIT
 
 echo "host=$(hostname)"
 nvidia-smi -L 2>/dev/null || true
 ( cd "$REPO" && echo "fork commit: $(git rev-parse --short HEAD 2>/dev/null)" ) || true
-echo "prompt: first ${PROMPT_CHARS} bytes of $(basename "$DATASET")"
+echo "corpus: first ${CORPUS_CHARS} bytes of $(basename "$DATASET") -> ${NUM_CHUNKS} x ${CHUNK_CHARS}-byte prompts"
 echo
 
-# run <label> <logfile> <command...> - capture full output, echo the lines that carry the numbers.
+# run <label> <logfile> <command...> - capture full output, echo the strong-scaling result lines.
 run() {
   local label="$1"; shift
   local log="$1";   shift
   echo "=== $label ==="
   if "$@" > "$log" 2>&1; then
-    # single-stream prints "decoded ... t/s" + "accept ="; the DP path prints the table + aggregate.
-    grep -E "decoded .* t/s|accept +=|^\| *(REP|[0-9]|ALL)|aggregate decode" "$log" || echo "  (no result lines - see $log)"
+    grep -E "strong scaling:|prompts ok|gen tokens in|load balance|^\| *[0-9]" "$log" \
+      || echo "  (no result lines - see $log)"
   else
     echo "FAILED ($label) - see $log"; tail -n 20 "$log"
   fi
   echo
 }
+
+# pull the wall-clock seconds out of a strong-run log ("... in 12.185s wall ...").
+wall_of() { sed -nE 's/.* in ([0-9.]+)s wall.*/\1/p' "$1" | head -1; }
 
 for pair in "${SPEC_PAIRS[@]}"; do
   IFS='|' read -r target draft plabel <<< "$pair"
@@ -99,25 +104,35 @@ for pair in "${SPEC_PAIRS[@]}"; do
              -c "$CTX" -b "$BATCH" -ub "$UBATCH" -ngl "$NGL" -ngld "$NGLD"
              -ctk "$CTK" -ctv "$CTV" -s "$SEED"
              --spec-draft-n-max "$dmax" --spec-draft-n-min "$DMIN"
-             -n "$N_PREDICT" -f "$PROMPT_FILE" )
+             -n "$N_PREDICT" -f "$CORPUS_FILE" --dp-chunk-chars "$CHUNK_CHARS" )
 
-    # (A) 1 GPU, single spec stream (baseline)
+    base_log="$RESULTS/${plabel}.dmax${dmax}.1gpu-serial.log"
+    par_log="$RESULTS/${plabel}.dmax${dmax}.${DP}gpu-strong.log"
+
+    # (A) 1 GPU serial baseline: all M prompts on one GPU
     export CUDA_VISIBLE_DEVICES=0
-    run "SPEC | $plabel | dmax=$dmax | 1 GPU baseline" \
-        "$RESULTS/${plabel}.dmax${dmax}.1gpu.log" \
-        "$BIN" "${common[@]}"
+    run "SPEC strong | $plabel | dmax=$dmax | 1 GPU serial baseline" \
+        "$base_log" \
+        "$BIN" "${common[@]}" --data-parallel 1
 
-    # (B) 4 GPUs, -dp 4 (one target+draft per GPU) - weak-scaling aggregate
+    # (B) DP GPUs strong: M prompts work-stolen across DP (target+draft) pairs
     export CUDA_VISIBLE_DEVICES=0,1,2,3
-    run "SPEC | $plabel | dmax=$dmax | ${DP} GPUs --data-parallel" \
-        "$RESULTS/${plabel}.dmax${dmax}.${DP}gpu-dp.log" \
+    run "SPEC strong | $plabel | dmax=$dmax | ${DP} GPUs work-stealing" \
+        "$par_log" \
         "$BIN" "${common[@]}" --data-parallel "$DP" --dp-devices 0,1,2,3
+
+    # real speedup = serial wall / parallel wall
+    t1="$(wall_of "$base_log")"; t4="$(wall_of "$par_log")"
+    awk -v a="$t1" -v b="$t4" -v dp="$DP" 'BEGIN{
+      if (a != "" && b != "" && b+0 > 0)
+        printf "  >> REAL STRONG SPEEDUP (1 GPU / %d GPU): %ss / %ss = %.2fx\n\n", dp, a, b, a/b;
+      else print "  >> speedup: could not parse walls (see logs)\n";
+    }'
   done
 done
 
 echo "done -> $RESULTS"
-echo "verify: per (pair,dmax), the DP 'ALL' decode t/s should be ~${DP}x the 1-GPU 'decoded ... t/s',"
-echo "        and with the fixed seed each replica's n_accept / accept% should match the 1-GPU run"
-echo "        (modulo tiny GPU FP nondeterminism). compare the 'ALL' decode t/s (max-span, generation"
-echo "        phase only - apples-to-apples with the baseline). the separate 'aggregate decode ... e2e'"
-echo "        line is lower because it includes the prompt encode + per-replica finish skew."
+echo "headline: per (pair,dmax) the 'REAL STRONG SPEEDUP' = serial-wall / parallel-wall over the SAME"
+echo "          M distinct prompts (ideal = ${DP}). per-replica 'jobs' columns show the work balance;"
+echo "          'load balance' = sum(per-prompt time)/wall (~${DP} when balanced). 'aggregate decode t/s'"
+echo "          is generated tokens / wall on distinct work - the real offline-batch throughput."

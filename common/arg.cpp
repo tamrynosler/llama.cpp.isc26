@@ -2508,6 +2508,28 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_DP_REPLICAS_PER_DEVICE"));
     add_opt(common_arg(
+        {"--dp-weak"},
+        "data-parallel speculative decoding: WEAK scaling - every replica runs the identical stream\n"
+        "(same prompt). a scaling-efficiency/correctness diagnostic, NOT a real-work throughput number.\n"
+        "default is STRONG scaling (distinct corpus shards per replica). consumed by llama-speculative.",
+        [](common_params & params) {
+            params.dp_weak = true;
+        }
+    ).set_env("LLAMA_ARG_DP_WEAK"));
+    add_opt(common_arg(
+        {"--dp-chunk-chars"}, "N",
+        "data-parallel speculative decoding (STRONG scaling): bytes per corpus shard - the input prompt\n"
+        "is sliced into N-byte chunks, one distinct prompt per chunk, distributed across replicas.\n"
+        "N>0 also engages the batch path at any replica count, so '-dp 1 --dp-chunk-chars N' is the\n"
+        "single-GPU serial baseline. 0 (default) = off. consumed by llama-speculative.",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--dp-chunk-chars must be >= 0");
+            }
+            params.dp_chunk_chars = value;
+        }
+    ).set_env("LLAMA_ARG_DP_CHUNK_CHARS"));
+    add_opt(common_arg(
         { "-fit", "--fit" }, "[on|off]",
         string_format("whether to adjust unset arguments to fit in device memory ('on' or 'off', default: '%s')", params.fit_params ? "on" : "off"),
         [](common_params & params, const std::string & value) {

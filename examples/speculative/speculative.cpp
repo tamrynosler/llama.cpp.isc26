@@ -85,12 +85,87 @@ static bool any_gpu_device() {
     return false;
 }
 
-// Weak-scaling data-parallel speculative decoding: N replicas, each holding a (target + draft)
-// model pair pinned to one GPU, each running an independent spec-decode stream concurrently, so the
-// spec speedup and the ~Nx replica speedup compound. UNIT 1: build + tear down the N (target, draft)
-// pairs to validate construction; the spec-decode loop + throughput aggregation land in Unit 2.
-// Single-replica (-dp 1) never reaches here (orchestrator_dp_active is false), so the stock
-// single-stream path below stays byte-identical.
+// STRONG scaling (the default, real-work metric): slice the input corpus into M distinct,
+// non-overlapping prompts of params.dp_chunk_chars bytes each and submit all M to the work-stealing
+// pool; replicas pull prompts as they finish. Throughput is total generated tokens / wall-clock on
+// DISTINCT work - not the same prompt duplicated. At n_rep==1 this is the single-GPU serial baseline.
+static int run_dp_strong(const common_params & params, orchestrator_pool & pool,
+                         std::vector<common_init_result_ptr> & drafts,
+                         const llama_model * model_tgt, int n_rep) {
+    const int           chunk  = params.dp_chunk_chars > 0 ? params.dp_chunk_chars : 4096;
+    const std::string & corpus = params.prompt;
+
+    // slice into non-overlapping chunk-byte shards (drop a trailing partial chunk; if the whole corpus
+    // is smaller than one chunk, use it as a single prompt).
+    std::vector<std::string> chunks;
+    for (size_t off = 0; off + (size_t) chunk <= corpus.size(); off += (size_t) chunk) {
+        chunks.emplace_back(corpus.substr(off, (size_t) chunk));
+    }
+    if (chunks.empty()) {
+        chunks.push_back(corpus);
+    }
+    const int M = (int) chunks.size();
+    LOG_INF("%s: strong scaling: %d distinct prompts (%d-byte shards) across %d replicas\n",
+            __func__, M, chunk, n_rep);
+
+    std::vector<spec_stream_stats> job_stats(M);          // distinct index per job -> race-free
+    std::vector<int>               rep_jobs(n_rep, 0);    // each index written only by its own worker
+    std::vector<long long>         rep_tokens(n_rep, 0);
+
+    for (int i = 0; i < M; ++i) {
+        pool.submit([&job_stats, &drafts, &rep_jobs, &rep_tokens, model_tgt, &params, &chunks, i]
+                    (llama_context * ctx_tgt, int rr) -> bool {
+            common_params jp = params;        // per-job copy (concurrent read-only copy of params is safe)
+            jp.prompt = chunks[i];
+            job_stats[i] = run_spec_stream(ctx_tgt, drafts[rr]->context(),
+                                           model_tgt, drafts[rr]->model(), jp, /*print=*/false);
+            rep_jobs[rr]   += 1;
+            rep_tokens[rr] += job_stats[i].n_predict;
+            return job_stats[i].ok;
+        });
+    }
+    const orchestrator_run_stats run = pool.drain();
+
+    long long tot_predict = 0, tot_drafted = 0, tot_accept = 0;
+    double    sum_job_time = 0.0;             // serial-equivalent work (enc+dec), measured under load
+    size_t    ok_jobs = 0;
+    for (int i = 0; i < M; ++i) {
+        const spec_stream_stats & s = job_stats[i];
+        if (s.ok) {
+            ok_jobs++;
+            tot_predict  += s.n_predict;
+            tot_drafted  += s.n_drafted;
+            tot_accept   += s.n_accept;
+            sum_job_time += s.t_enc_s + s.t_dec_s;
+        }
+    }
+    const double wall    = run.seconds;
+    const double agg_tps = wall > 0.0 ? (double) tot_predict / wall : 0.0;
+    const double accept  = tot_drafted > 0 ? 100.0 * (double) tot_accept / (double) tot_drafted : 0.0;
+    const double balance = wall > 0.0 ? sum_job_time / wall : 0.0;  // ~n_rep when well balanced
+
+    LOG("\n");
+    LOG("%s: strong-scaling DP speculative decoding: %d distinct prompts across %d replicas\n",
+        __func__, M, n_rep);
+    LOG("|%4s | %6s | %12s |\n", "REP", "jobs", "gen tokens");
+    LOG("|%4s-|-%6s-|-%12s-|\n", "----", "------", "------------");
+    for (int r = 0; r < n_rep; ++r) {
+        LOG("|%4d | %6d | %12lld |\n", r, rep_jobs[r], rep_tokens[r]);
+    }
+    LOG("\n");
+    LOG("%s: %zu/%d prompts ok | %lld gen tokens in %.3fs wall | aggregate decode %.2f t/s | accept %.2f%%\n",
+        __func__, ok_jobs, M, tot_predict, wall, agg_tps, accept);
+    LOG("%s: load balance: sum(per-prompt enc+dec) %.3fs / wall %.3fs = %.2fx of %d replicas\n",
+        __func__, sum_job_time, wall, balance, n_rep);
+    LOG("%s: real speedup vs 1 GPU = compare this wall to the '-dp 1 --dp-chunk-chars %d' baseline wall\n",
+        __func__, chunk);
+
+    return ok_jobs == (size_t) M ? 0 : 1;
+}
+
+// Data-parallel speculative decoding entry: builds N (target+draft) replica pairs (one pair per GPU),
+// then runs STRONG scaling (default, distinct corpus shards) or WEAK scaling (--dp-weak diagnostic,
+// identical streams). The stock single-stream path (no -dp, no --dp-chunk-chars) never reaches here.
 static int speculative_dp(common_params & params) {
     llama_backend_init();
     llama_numa_init(params.numa);
@@ -137,13 +212,22 @@ static int speculative_dp(common_params & params) {
         drafts.push_back(std::move(init));
     }
 
-    LOG_INF("%s: built %d (target+draft) replica pair(s); running weak-scaling DP spec-decode\n",
-            __func__, n_rep);
+    LOG_INF("%s: built %d (target+draft) replica pair(s)\n", __func__, n_rep);
 
-    // run one spec-decode stream per replica, concurrently. the barrier deals exactly one job to each
-    // replica (1:1 target/draft pairing) and aligns the timed start. every replica gets the SAME prompt
-    // (weak scaling: aggregate throughput should approach n_rep x a single stream).
-    const llama_model *            model_tgt = pool->model();
+    const llama_model * model_tgt = pool->model();
+
+    // STRONG scaling (default): shard the corpus into distinct prompts across replicas - the real-work
+    // throughput metric. WEAK scaling (--dp-weak) below is the identical-stream diagnostic.
+    if (!params.dp_weak) {
+        const int rc = run_dp_strong(params, *pool, drafts, model_tgt, n_rep);
+        drafts.clear();
+        pool.reset();
+        llama_backend_free();
+        return rc;
+    }
+
+    // --- WEAK scaling (--dp-weak): every replica runs the SAME prompt. the barrier deals exactly one
+    // job to each replica (1:1 pairing) and aligns the timed start. NOT a real-work throughput number.
     std::vector<spec_stream_stats> rep_stats(n_rep);
     auto                           barrier   = std::make_shared<spec_barrier>(n_rep);
     for (int r = 0; r < n_rep; ++r) {
@@ -224,9 +308,11 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    // data-parallel path: N (target+draft) replicas run independent spec-decode streams concurrently.
-    // inactive (-dp 1, default) -> falls through to the unchanged single-stream path below.
-    if (orchestrator_dp_active(params)) {
+    // data-parallel path: N (target+draft) replicas run spec-decode streams concurrently. engages when
+    // the orchestrator is active (-dp > 1) OR a strong-scaling shard size is given (--dp-chunk-chars > 0,
+    // which also enables the n_rep==1 serial baseline). plain single-stream (no -dp, no chunk) falls
+    // through to the unchanged path below.
+    if (orchestrator_dp_active(params) || params.dp_chunk_chars > 0) {
         return speculative_dp(params);
     }
 
