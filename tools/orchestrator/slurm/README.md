@@ -13,6 +13,7 @@ or more nodes of the target cluster (4x H100 per node). Logs land in
 | `dp-batched-bench.slurm`  | this fork `~/llama.cpp.isc26` | per model: 1 GPU baseline vs 4 GPUs `--data-parallel 4` batched-bench. The GPU-bound throughput showcase; compare the DP `ALL` row against the 1-GPU row. No input dataset (random tokens). |
 | `dp-multinode-srun.slurm` | this fork `~/llama.cpp.isc26` | **multi-node (prototype).** `srun` fans the single-node DP sweep to every node; `aggregate-multinode.py` sums per-node throughput offline. RPC-free, no in-binary coordination. Job 453 = 2.00x on 2 nodes. |
 | `dp-batched-bench-cluster.slurm` | this fork `~/llama.cpp.isc26` | **multi-node (C++-native).** Same workload as the prototype, but coordination + aggregation happen **in-binary** via the MPI `cluster_link` (`srun --mpi=pmix`, one rank per node). No python. Output carries per-`NODE` rows + a `CL` cluster row. Requires the `-DLLAMA_ORCH_MPI=ON` build. |
+| `dp-speculative.slurm` | this fork `~/llama.cpp.isc26` | **speculative decoding + DP.** per (target,draft) pair + draft length: 1 GPU single spec stream vs 4 GPUs `--data-parallel 4` (one target+draft pair per GPU). Combines the spec speedup with the replica speedup; compare the DP `ALL`-row decode t/s vs the 1-GPU `decoded … t/s`, acceptance% unchanged. Single-node, no MPI. |
 
 Fill in the `MODELS`, repo paths, and `INPUT` variables at the top of each
 script (use the **same 3 models** in both). Build the relevant repo with
