@@ -61,7 +61,12 @@ PL=1,2,4,8,16,32,64  # parallel sequences per replica (the main throughput lever
 MPI_PMI=pmix         # srun PMI plugin (cluster offers: pmi2, pmix). HPC-X speaks pmix.
 # -----------------------------------------------------------------------------
 
-ml gcc hpcx cuda     # pin if needed: ml gcc/15.2 hpcx/2.26 cuda/13.3
+ml gcc cuda hpcx     # ORDER MATTERS: hpcx requires cuda already loaded. pin: ml gcc/15.2 cuda/13.3 hpcx/2.26
+
+# --export=ALL pushes the loaded module env (CUDA + HPC-X libs, all on shared NFS) to every srun task,
+# so the remote rank can find libcudart / libmpi. --kill-on-bad-exit=1 tears the step down if any rank
+# dies (e.g. a missing lib) instead of leaving the survivors deadlocked in MPI_Init/pmix.
+SRUN_OPTS="--export=ALL --kill-on-bad-exit=1"
 
 RESULTS="$REPO/results/dp-cluster-${SLURM_JOB_ID:-local}"
 mkdir -p "$RESULTS"
@@ -79,7 +84,7 @@ export CUDA_VISIBLE_DEVICES=0,1,2,3
 PREFLIGHT="$REPO/build-mpi/bin/llama-orchestrator-cluster-test"
 if [[ -x "$PREFLIGHT" ]]; then
   echo "=== pmix pre-flight: cluster_link on ${SLURM_NNODES:-2} nodes (--mpi=$MPI_PMI) ==="
-  if ! srun --mpi="$MPI_PMI" --nodes="${SLURM_NNODES:-2}" --ntasks-per-node=1 "$PREFLIGHT"; then
+  if ! srun --mpi="$MPI_PMI" $SRUN_OPTS --nodes="${SLURM_NNODES:-2}" --ntasks-per-node=1 "$PREFLIGHT"; then
     echo "FATAL: cluster_link pre-flight failed under --mpi=$MPI_PMI; try MPI_PMI=pmi2." >&2
     exit 1
   fi
@@ -106,7 +111,7 @@ for M in "${MODELS[@]}"; do
   name="$(basename "$M" .gguf)"
   run "CLUSTER | $name | ${SLURM_NNODES:-?} nodes x $DP GPUs | --data-parallel $DP" \
       "$RESULTS/${name}.cluster.log" \
-      srun --mpi="$MPI_PMI" --nodes="${SLURM_NNODES:-2}" --ntasks-per-node=1 \
+      srun --mpi="$MPI_PMI" $SRUN_OPTS --nodes="${SLURM_NNODES:-2}" --ntasks-per-node=1 \
           "$BIN" -m "$M" -c "$CTX" -b "$NBATCH" -ub "$UBATCH" -ngl "$NGL" \
                  -npp "$PP" -ntg "$TG" -npl "$PL" \
                  --data-parallel "$DP" --dp-devices 0,1,2,3
