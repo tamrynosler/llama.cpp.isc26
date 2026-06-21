@@ -40,8 +40,12 @@ sbatch decode-temp/decode-baseline.slurm
 ```
 
 ### `decode-correctness.slurm` — output oracle
-Deterministic greedy generation (fixed prompt + seed, `--temp 0`, `-no-cnv`) per model. The
+Deterministic greedy generation via **`llama-simple`** (greedy argmax, real batch-1 decode
+loop, generate-and-exit — no interactive mode, no sampler params to misset) per model. The
 generated text is the reference; a decode optimization must reproduce it on the same GPU.
+(`llama-cli` is deliberately avoided: it defaults to interactive mode and loops on a batch
+job's empty stdin. Perplexity is a fine *quantitative* backup but exercises the batched
+prefill path, not the single-token decode kernel — so it's a complement, not the primary gate.)
 
 ```bash
 sbatch decode-temp/decode-correctness.slurm baseline   # reference (both models)
