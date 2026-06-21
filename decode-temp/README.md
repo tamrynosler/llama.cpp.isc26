@@ -54,15 +54,23 @@ diff decode-correct-dense-baseline.txt decode-correct-dense-opt1.txt
 ```
 
 ### `decode-profile.slurm` — decode profile (L2)
-Nsight Systems profile of the **dense** decode loop: three captures — depth 0 / depth 8192 /
-depth 8192 with CUDA graphs off (`GGML_CUDA_DISABLE_GRAPHS=1`). Each writes a `.nsys-rep`
-(GUI) + a `.summary.txt` (kernel-time ranking, CUDA API/launch time, memcpy). Answers where
-per-token time goes, how attention cost grows with KV depth, and how much launch overhead
-CUDA graphs already remove. `ncu` per-kernel memory-bandwidth analysis is the follow-up once
-nsys names the dominant kernels.
+Nsight Systems profile, **both regimes + both models**: dense at d0 / d8192 / d32768 (short →
+long context), dense d8192 with CUDA graphs off (launch-overhead control), and MoE at d0 / d8192.
+Each writes a `.nsys-rep` (GUI) + `.summary.txt` (kernel ranking, CUDA API/launch, memcpy). Shows
+where per-token time goes, how attention grows with KV depth, and how MoE differs from dense.
 
 ```bash
 sbatch decode-temp/decode-profile.slurm           # -> decode-profile-<jobid>/*.summary.txt
+```
+
+### `nsys-shape-breakdown.sh <capture>` — per-matmul-shape decomposition
+Un-collapses the GEMV (`mul_mat_vec_q`) by `gridX` (= output rows) so each bucket maps to a
+specific matmul (q/k/v/o, FFN gate-up/down, LM head) — the per-shape times give achieved
+bandwidth and show bandwidth-bound vs launch/occupancy-bound matmuls. Also dumps flash-attn by
+shape. Takes a `.nsys-rep` or `.sqlite`.
+
+```bash
+decode-temp/nsys-shape-breakdown.sh decode-profile-<jobid>/dense_d0_graphs_on.nsys-rep
 ```
 
 ### `decode-kvquant.slurm` — KV-cache quantization speedup
@@ -98,5 +106,23 @@ sbatch decode-temp/decode-profile-ncu.slurm       # -> decode-ncu-<jobid>/dense_
 Outputs/logs write to the launch CWD (not into the repo tree). Copy them back to the parent
 `cluster-reports/` per the project workflow.
 
-> **Assumed path:** the MoE model dir is taken to be `/shared/llms/models/` (only the dense
-> model's full path was given). Fix `MOE=` in both `.slurm` files if it lives elsewhere.
+## H100 main-cluster runbook (turnkey)
+
+The scripts are pinned to `xeon-cg2` (A100 practice). On the H100 cluster, override the node at
+submit time (sbatch CLI beats the `#SBATCH --nodelist` in-file) and rebuild for the H100 arch:
+
+```bash
+cd ~/llama.cpp.isc26 && git pull
+decode-temp/build-decode.sh 90a                                    # H100 = sm_90a (A100 was 80)
+H="<h100node>"; P="<partition>"                                    # e.g. cn001 / workers
+sbatch --nodelist=$H --partition=$P decode-temp/decode-baseline.slurm        # 1. throughput baseline
+sbatch --nodelist=$H --partition=$P decode-temp/decode-correctness.slurm baseline  # 2. golden output
+sbatch --nodelist=$H --partition=$P decode-temp/decode-profile.slurm         # 3. nsys (both regimes/models)
+# then on a login node:
+decode-temp/nsys-shape-breakdown.sh decode-profile-<jobid>/dense_d0_graphs_on.nsys-rep   # 4. GEMV by shape
+sbatch --nodelist=$H --partition=$P decode-temp/decode-profile-ncu.slurm     # 5. IF counter perms enabled
+```
+
+Notes: paths (`/shared/llms/...`) are shared-FS, same on both clusters. `DATASET=` for perplexity
+is overridable inline. The A100 finding — short-context decode is near the memory wall, KV-quant is
+a net loss — should be re-confirmed here (HBM3 bandwidth + cc 9.0 kernel-selection thresholds differ).

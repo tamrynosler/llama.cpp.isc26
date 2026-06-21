@@ -3,23 +3,26 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
-#SBATCH --time=00:40:00
+#SBATCH --time=01:30:00
 #SBATCH --nodelist=xeon-cg2
 #SBATCH --output=decode-profile-%j.log
 #
-# Track 2 (L2) — decode-phase profile with Nsight Systems (nsys).
+# Track 2 (L2) — decode-phase profile with Nsight Systems (nsys), both regimes + both models.
 #
-# Answers "where does per-token decode time go?" for the DENSE model (Qwen2.5-14B), with
-# three captures (one config each, so every timeline/summary is attributable):
-#   1. depth 0,    graphs on  — baseline decode kernel mix
-#   2. depth 8192, graphs on  — attention/KV cost that grows with KV depth (the L1 signal)
-#   3. depth 8192, graphs off — kernel-launch overhead that CUDA graphs remove (+ residual)
+# Captures (one config each, so every timeline/summary is attributable):
+#   dense d0    graphs on  — short-context decode kernel mix (GEMV-dominated, near memory wall)
+#   dense d8192 graphs on  — mid-context: attention/KV starts to grow
+#   dense d32768 graphs on — LONG-context regime: attention/KV becomes a major share
+#   dense d8192 graphs off — kernel-launch overhead that CUDA graphs remove (control)
+#   moe   d0    graphs on  — MoE short-context (expert routing differs from dense)
+#   moe   d8192 graphs on  — MoE mid-context
 #
-# Each capture writes a .nsys-rep (large; open in the Nsight GUI) AND a .summary.txt (small;
-# kernel-time ranking + CUDA API/launch time + memcpy time) — bring back the .summary.txt.
+# Each capture writes a .nsys-rep (GUI) + .summary.txt (kernel/API/memcpy tables). Then run
+# decode-temp/nsys-shape-breakdown.sh on a capture for the per-matmul-shape decomposition.
 #
-# Pinned: xeon-cg2 GPU 0. Build first with decode-temp/build-decode.sh 80.
-# nsys ships with the CUDA toolkit; if it's not on PATH try `ml nsight-systems`.
+# Pinned to xeon-cg2 GPU 0. For the H100 main cluster, override at submit time, e.g.:
+#   sbatch --nodelist=<h100node> --partition=<part> decode-temp/decode-profile.slurm
+# (and build with build-decode.sh 90a). nsys ships with CUDA; if missing try `ml nsight-systems`.
 #
 # Usage:  sbatch decode-temp/decode-profile.slurm
 
@@ -29,9 +32,20 @@ set -uo pipefail
 REPO="$HOME/llama.cpp.isc26"
 BIN="$REPO/build/bin/llama-bench"
 DENSE="/shared/llms/models/Qwen2.5-14B-Instruct-Q4_0.gguf"
+MOE="/shared/llms/models/deepseek-moe-16b-base.Q4_K_M.gguf"
 GPU_IDX=0
 NGEN=128             # decode steps to profile (plenty for the CUDA graph to warm up + steady state)
 OUTDIR="decode-profile-${SLURM_JOB_ID:-manual}"
+
+# name                   model  depth  graphs(on|off)
+PROFILES=(
+  "dense_d0_graphs_on     DENSE  0      on"
+  "dense_d8192_graphs_on  DENSE  8192   on"
+  "dense_d32768_graphs_on DENSE  32768  on"
+  "dense_d8192_graphs_off DENSE  8192   off"
+  "moe_d0_graphs_on       MOE    0      on"
+  "moe_d8192_graphs_on    MOE    8192   on"
+)
 # -----------------------------------------------------------------------------
 
 ml gcc cuda
@@ -46,26 +60,21 @@ mkdir -p "$OUTDIR"
 echo "node=$(hostname) commit=$(git -C "$REPO" rev-parse --short HEAD)" >&2
 nsys --version >&2
 
-# name  depth  graphs(on|off)
-run_profile() {
-    local name="$1" depth="$2" graphs="$3"
-    local rep="$OUTDIR/$name"
-    local pre=()
-    [ "$graphs" = "off" ] && pre=(env GGML_CUDA_DISABLE_GRAPHS=1)   # disable CUDA graphs for this run only
-    echo ">>> $name (depth=$depth graphs=$graphs)" >&2
+for cfg in "${PROFILES[@]}"; do
+    read -r name model_var depth graphs <<< "$cfg"
+    model="${!model_var}"            # indirect: DENSE / MOE -> path
+    rep="$OUTDIR/$name"
+    pre=()
+    [ "$graphs" = "off" ] && pre=(env GGML_CUDA_DISABLE_GRAPHS=1)
+    echo ">>> $name (model=$model_var depth=$depth graphs=$graphs)" >&2
     "${pre[@]}" nsys profile \
         --trace=cuda,nvtx,osrt \
         --cuda-graph-trace=node \
         --force-overwrite true \
         -o "$rep" \
-        "$BIN" -m "$DENSE" -ngl 99 -p 0 -n "$NGEN" -d "$depth" -fa 1 -r 1 --no-warmup -o md
-    # readable summaries (kernel/API/memcpy tables) so we don't need the GUI to read the result
+        "$BIN" -m "$model" -ngl 99 -p 0 -n "$NGEN" -d "$depth" -fa 1 -r 1 --no-warmup -o md
     nsys stats --force-export=true "$rep.nsys-rep" > "$rep.summary.txt" 2>&1
     echo "    -> $rep.nsys-rep + $rep.summary.txt" >&2
-}
+done
 
-run_profile dense_d0_graphs_on     0    on
-run_profile dense_d8192_graphs_on  8192 on
-run_profile dense_d8192_graphs_off 8192 off
-
-echo "done -> $OUTDIR/  (paste the *.summary.txt back; copy the dir to ../cluster-reports/)" >&2
+echo "done -> $OUTDIR/  (paste *.summary.txt; run nsys-shape-breakdown.sh on a capture)" >&2
