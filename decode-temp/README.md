@@ -65,6 +65,17 @@ nsys names the dominant kernels.
 sbatch decode-temp/decode-profile.slurm           # -> decode-profile-<jobid>/*.summary.txt
 ```
 
+### `decode-kvquant.slurm` — KV-cache quantization speedup
+Sweeps f16 vs q8_0 vs q4_0 KV cache across KV depths (0→32768) with `-fa 1`, dense model. The
+benefit grows with context (smaller cache → fewer bytes read by attention each step). Requires
+flash attention (quantized KV only works on the FA path) and a build with
+`-DGGML_CUDA_FA_ALL_QUANTS=ON` (build-decode.sh has it). **Lossy** — speed/quality tradeoff, not
+output-preserving; quantify quality separately with `llama-perplexity` per KV type.
+
+```bash
+sbatch decode-temp/decode-kvquant.slurm     # compare tg at each depth: q8_0/q4_0 vs f16
+```
+
 ### `decode-profile-ncu.slurm` — per-kernel drill (L2b)
 Nsight Compute on the decode kernels nsys flagged (`mul_mat_vec_q`, `quantize_q8_1`,
 `rms_norm_f32`, `flash_attn_ext_f16`). Reports Memory vs Compute throughput (% of peak) and
