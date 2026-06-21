@@ -76,6 +76,15 @@ output-preserving; quantify quality separately with `llama-perplexity` per KV ty
 sbatch decode-temp/decode-kvquant.slurm     # compare tg at each depth: q8_0/q4_0 vs f16
 ```
 
+### `decode-perplexity.slurm` — quality / correctness oracle
+Runs `llama-perplexity` over wikitext for f16/q8_0/q4_0 KV (quantifies KV-quant's quality cost),
+and doubles as the **quantitative correctness oracle** for L3: a decode kernel change should leave
+PPL unchanged within tolerance (f16, before vs after). Complements the `llama-simple` greedy diff.
+
+```bash
+sbatch decode-temp/decode-perplexity.slurm    # Final estimate: PPL per KV type
+```
+
 ### `decode-profile-ncu.slurm` — per-kernel drill (L2b)
 Nsight Compute on the decode kernels nsys flagged (`mul_mat_vec_q`, `quantize_q8_1`,
 `rms_norm_f32`, `flash_attn_ext_f16`). Reports Memory vs Compute throughput (% of peak) and
