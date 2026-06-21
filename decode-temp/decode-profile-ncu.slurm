@@ -23,6 +23,11 @@
 # Pinned: xeon-cg2 GPU 0. Build first with decode-temp/build-decode.sh 80.
 # ncu ships with the CUDA toolkit; if it's not on PATH try `ml nsight-compute`.
 #
+# REQUIRES GPU performance-counter access. If you see "ERR_NVGPUCTRPERM", the node restricts
+# counters to admins — ask the cluster admin to set, in /etc/modprobe.d/:
+#     options nvidia NVreg_RestrictProfilingToAdminUsers=0
+# and reload the nvidia module / reboot. (nsys does NOT need this; only ncu does.)
+#
 # Usage:  sbatch decode-temp/decode-profile-ncu.slurm
 
 set -uo pipefail
