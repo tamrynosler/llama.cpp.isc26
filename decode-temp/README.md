@@ -53,6 +53,18 @@ sbatch decode-temp/decode-correctness.slurm opt1       # after a change
 diff decode-correct-dense-baseline.txt decode-correct-dense-opt1.txt
 ```
 
+### `decode-profile.slurm` — decode profile (L2)
+Nsight Systems profile of the **dense** decode loop: three captures — depth 0 / depth 8192 /
+depth 8192 with CUDA graphs off (`GGML_CUDA_DISABLE_GRAPHS=1`). Each writes a `.nsys-rep`
+(GUI) + a `.summary.txt` (kernel-time ranking, CUDA API/launch time, memcpy). Answers where
+per-token time goes, how attention cost grows with KV depth, and how much launch overhead
+CUDA graphs already remove. `ncu` per-kernel memory-bandwidth analysis is the follow-up once
+nsys names the dominant kernels.
+
+```bash
+sbatch decode-temp/decode-profile.slurm           # -> decode-profile-<jobid>/*.summary.txt
+```
+
 Outputs/logs write to the launch CWD (not into the repo tree). Copy them back to the parent
 `cluster-reports/` per the project workflow.
 
