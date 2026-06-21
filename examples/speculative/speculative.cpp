@@ -3,11 +3,16 @@
 #include "sampling.h"
 #include "log.h"
 #include "llama.h"
+#include "ggml-backend.h"
+#include "orchestrator.h"
 
 #include <algorithm>
 #include <clocale>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <memory>
+#include <mutex>
 #include <random>
 #include <set>
 #include <string>
@@ -29,6 +34,255 @@ struct seq_draft {
 
     struct common_sampler * smpl = nullptr;
 };
+
+// per-stream result of one speculative-decoding run (one replica in the DP case).
+struct spec_stream_stats {
+    int    n_input   = 0;
+    int    n_predict = 0;
+    int    n_drafted = 0;
+    int    n_accept  = 0;
+    double t_enc_s   = 0.0;
+    double t_dec_s   = 0.0;
+    bool   ok        = false;
+};
+
+// single-use barrier: forces the work-stealing pool to deal exactly one job to each of the N replicas
+// (so replica r's job runs on target ctx r paired with draft ctx r) and aligns the timed start.
+// mirrors batched-bench's bb_barrier (std::barrier is C++20; this tree targets C++17).
+struct spec_barrier {
+    std::mutex              mtx;
+    std::condition_variable cv;
+    int                     count;
+    const int               target;
+    explicit spec_barrier(int n) : count(0), target(n) {}
+    void arrive_and_wait() {
+        std::unique_lock<std::mutex> lk(mtx);
+        if (++count >= target) {
+            cv.notify_all();
+        } else {
+            cv.wait(lk, [&] { return count >= target; });
+        }
+    }
+};
+
+// runs ONE speculative-decoding stream on an already-loaded (target, draft) context pair; defined
+// after main(). `print` gates the user-facing token stream + perf report (off for DP replicas).
+static spec_stream_stats run_spec_stream(
+    llama_context * ctx_tgt, llama_context * ctx_dft,
+    const llama_model * model_tgt, const llama_model * model_dft,
+    common_params params, bool print);  // params by value: common_sampler_init wants a mutable
+                                        // sampling ref, and a per-call copy keeps DP replicas race-free
+
+// true if at least one GPU backend device is present. when false everything runs on CPU and a
+// main_gpu / split_mode=NONE override would be rejected by llama_prepare_model_devices, so the draft
+// placement below is only applied when a GPU exists (mirrors orchestrator_make_pool's own guard).
+static bool any_gpu_device() {
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        if (ggml_backend_dev_type(ggml_backend_dev_get(i)) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// STRONG scaling (the default, real-work metric): slice the input corpus into M distinct,
+// non-overlapping prompts of params.dp_chunk_chars bytes each and submit all M to the work-stealing
+// pool; replicas pull prompts as they finish. Throughput is total generated tokens / wall-clock on
+// DISTINCT work - not the same prompt duplicated. At n_rep==1 this is the single-GPU serial baseline.
+static int run_dp_strong(const common_params & params, orchestrator_pool & pool,
+                         std::vector<common_init_result_ptr> & drafts,
+                         const llama_model * model_tgt, int n_rep) {
+    const int           chunk  = params.dp_chunk_chars > 0 ? params.dp_chunk_chars : 4096;
+    const std::string & corpus = params.prompt;
+
+    // slice into non-overlapping chunk-byte shards (drop a trailing partial chunk; if the whole corpus
+    // is smaller than one chunk, use it as a single prompt).
+    std::vector<std::string> chunks;
+    for (size_t off = 0; off + (size_t) chunk <= corpus.size(); off += (size_t) chunk) {
+        chunks.emplace_back(corpus.substr(off, (size_t) chunk));
+    }
+    if (chunks.empty()) {
+        chunks.push_back(corpus);
+    }
+    const int M = (int) chunks.size();
+    LOG_INF("%s: strong scaling: %d distinct prompts (%d-byte shards) across %d replicas\n",
+            __func__, M, chunk, n_rep);
+
+    std::vector<spec_stream_stats> job_stats(M);          // distinct index per job -> race-free
+    std::vector<int>               rep_jobs(n_rep, 0);    // each index written only by its own worker
+    std::vector<long long>         rep_tokens(n_rep, 0);
+
+    for (int i = 0; i < M; ++i) {
+        pool.submit([&job_stats, &drafts, &rep_jobs, &rep_tokens, model_tgt, &params, &chunks, i]
+                    (llama_context * ctx_tgt, int rr) -> bool {
+            common_params jp = params;        // per-job copy (concurrent read-only copy of params is safe)
+            jp.prompt = chunks[i];
+            job_stats[i] = run_spec_stream(ctx_tgt, drafts[rr]->context(),
+                                           model_tgt, drafts[rr]->model(), jp, /*print=*/false);
+            rep_jobs[rr]   += 1;
+            rep_tokens[rr] += job_stats[i].n_predict;
+            return job_stats[i].ok;
+        });
+    }
+    const orchestrator_run_stats run = pool.drain();
+
+    long long tot_predict = 0, tot_drafted = 0, tot_accept = 0;
+    double    sum_job_time = 0.0;             // serial-equivalent work (enc+dec), measured under load
+    size_t    ok_jobs = 0;
+    for (int i = 0; i < M; ++i) {
+        const spec_stream_stats & s = job_stats[i];
+        if (s.ok) {
+            ok_jobs++;
+            tot_predict  += s.n_predict;
+            tot_drafted  += s.n_drafted;
+            tot_accept   += s.n_accept;
+            sum_job_time += s.t_enc_s + s.t_dec_s;
+        }
+    }
+    const double wall    = run.seconds;
+    const double agg_tps = wall > 0.0 ? (double) tot_predict / wall : 0.0;
+    const double accept  = tot_drafted > 0 ? 100.0 * (double) tot_accept / (double) tot_drafted : 0.0;
+    const double balance = wall > 0.0 ? sum_job_time / wall : 0.0;  // ~n_rep when well balanced
+
+    LOG("\n");
+    LOG("%s: strong-scaling DP speculative decoding: %d distinct prompts across %d replicas\n",
+        __func__, M, n_rep);
+    LOG("|%4s | %6s | %12s |\n", "REP", "jobs", "gen tokens");
+    LOG("|%4s-|-%6s-|-%12s-|\n", "----", "------", "------------");
+    for (int r = 0; r < n_rep; ++r) {
+        LOG("|%4d | %6d | %12lld |\n", r, rep_jobs[r], rep_tokens[r]);
+    }
+    LOG("\n");
+    LOG("%s: %zu/%d prompts ok | %lld gen tokens in %.3fs wall | aggregate decode %.2f t/s | accept %.2f%%\n",
+        __func__, ok_jobs, M, tot_predict, wall, agg_tps, accept);
+    LOG("%s: load balance: sum(per-prompt enc+dec) %.3fs / wall %.3fs = %.2fx of %d replicas\n",
+        __func__, sum_job_time, wall, balance, n_rep);
+    LOG("%s: real speedup vs 1 GPU = compare this wall to the '-dp 1 --dp-chunk-chars %d' baseline wall\n",
+        __func__, chunk);
+
+    return ok_jobs == (size_t) M ? 0 : 1;
+}
+
+// Data-parallel speculative decoding entry: builds N (target+draft) replica pairs (one pair per GPU),
+// then runs STRONG scaling (default, distinct corpus shards) or WEAK scaling (--dp-weak diagnostic,
+// identical streams). The stock single-stream path (no -dp, no --dp-chunk-chars) never reaches here.
+static int speculative_dp(common_params & params) {
+    llama_backend_init();
+    llama_numa_init(params.numa);
+
+    // snapshot the draft placement before building the pool: orchestrator_make_pool builds the
+    // TARGET replicas from params.model, so it must run while params.model is still the target.
+    const auto    dft_mparams = params.speculative.draft.mparams;
+    const int32_t dft_ngl     = params.speculative.draft.n_gpu_layers;
+
+    // one target model replica per device (pinned), built + scheduled by the orchestrator.
+    auto pool = orchestrator_make_pool(params, orchestrator_specs_from_params(params));
+    if (!pool) {
+        LOG_ERR("%s: failed to build the target replica pool\n", __func__);
+        llama_backend_free();
+        return 1;
+    }
+    const int n_rep = pool->size();
+
+    // one draft model + context per replica, co-located on that replica's GPU (pin via main_gpu,
+    // mirroring how the orchestrator pins single-device target replicas). on a CPU-only build there
+    // is no device to pin to, so the override is skipped (the draft loads on CPU like the stock tool).
+    const bool has_gpu = any_gpu_device();
+    std::vector<common_init_result_ptr> drafts;
+    drafts.reserve(n_rep);
+    for (int r = 0; r < n_rep; ++r) {
+        common_params dp = params;                  // copy; mutate only the draft model + placement
+        dp.model        = dft_mparams;
+        dp.n_gpu_layers = dft_ngl;
+        if (has_gpu) {
+            dp.devices.clear();                     // co-locate with target replica r via main_gpu
+            dp.split_mode = LLAMA_SPLIT_MODE_NONE;
+            dp.main_gpu   = pool->at(r).device;
+        }
+
+        auto init = common_init_from_params(dp);
+        if (!init || !init->model() || !init->context()) {
+            LOG_ERR("%s: replica %d: failed to load draft model '%s'\n",
+                    __func__, r, dft_mparams.path.c_str());
+            drafts.clear();
+            pool.reset();
+            llama_backend_free();
+            return 1;
+        }
+        drafts.push_back(std::move(init));
+    }
+
+    LOG_INF("%s: built %d (target+draft) replica pair(s)\n", __func__, n_rep);
+
+    const llama_model * model_tgt = pool->model();
+
+    // STRONG scaling (default): shard the corpus into distinct prompts across replicas - the real-work
+    // throughput metric. WEAK scaling (--dp-weak) below is the identical-stream diagnostic.
+    if (!params.dp_weak) {
+        const int rc = run_dp_strong(params, *pool, drafts, model_tgt, n_rep);
+        drafts.clear();
+        pool.reset();
+        llama_backend_free();
+        return rc;
+    }
+
+    // --- WEAK scaling (--dp-weak): every replica runs the SAME prompt. the barrier deals exactly one
+    // job to each replica (1:1 pairing) and aligns the timed start. NOT a real-work throughput number.
+    std::vector<spec_stream_stats> rep_stats(n_rep);
+    auto                           barrier   = std::make_shared<spec_barrier>(n_rep);
+    for (int r = 0; r < n_rep; ++r) {
+        pool->submit([&rep_stats, &drafts, model_tgt, &params, barrier](llama_context * ctx_tgt, int rr) -> bool {
+            barrier->arrive_and_wait();
+            rep_stats[rr] = run_spec_stream(ctx_tgt, drafts[rr]->context(),
+                                            model_tgt, drafts[rr]->model(),
+                                            params, /*print=*/false);
+            return rep_stats[rr].ok;
+        });
+    }
+    const orchestrator_run_stats run = pool->drain();
+
+    // per-replica decode tok/s + acceptance, then an ALL row carrying the weak-scaling totals.
+    LOG("\n");
+    LOG("%s: weak-scaling DP speculative decoding: %d replicas, same prompt each\n", __func__, n_rep);
+    LOG("|%4s | %9s | %9s | %9s | %8s | %12s |\n", "REP", "n_predict", "n_drafted", "n_accept", "accept%", "decode t/s");
+    LOG("|%4s-|-%9s-|-%9s-|-%9s-|-%8s-|-%12s-|\n", "----", "---------", "---------", "---------", "--------", "------------");
+
+    int    tot_predict = 0, tot_drafted = 0, tot_accept = 0;
+    double max_t_dec   = 0.0;
+    size_t ok_reps     = 0;
+    for (int r = 0; r < n_rep; ++r) {
+        const spec_stream_stats & s = rep_stats[r];
+        const double dec_tps = s.t_dec_s   > 0.0 ? s.n_predict / s.t_dec_s     : 0.0;
+        const double acc_pct = s.n_drafted > 0   ? 100.0 * s.n_accept / s.n_drafted : 0.0;
+        char rep_label[8];
+        snprintf(rep_label, sizeof(rep_label), "%d", r);
+        LOG("|%4s | %9d | %9d | %9d | %7.2f%% | %12.2f |\n",
+            rep_label, s.n_predict, s.n_drafted, s.n_accept, acc_pct, dec_tps);
+        if (s.ok) {
+            ok_reps++;
+            tot_predict += s.n_predict;
+            tot_drafted += s.n_drafted;
+            tot_accept  += s.n_accept;
+            max_t_dec    = std::max(max_t_dec, s.t_dec_s);
+        }
+    }
+    // aggregate decode throughput: total predicted tokens over the concurrent span. max_t_dec = slowest
+    // replica's own decode time; run.seconds = pool drain() span (first dispatch -> last completion).
+    const double agg_tps_max = max_t_dec   > 0.0 ? tot_predict / max_t_dec  : 0.0;
+    const double agg_tps_e2e = run.seconds > 0.0 ? tot_predict / run.seconds : 0.0;
+    const double agg_acc_pct = tot_drafted > 0   ? 100.0 * tot_accept / tot_drafted : 0.0;
+    LOG("|%4s | %9d | %9d | %9d | %7.2f%% | %12.2f |\n",
+        "ALL", tot_predict, tot_drafted, tot_accept, agg_acc_pct, agg_tps_max);
+    LOG("\n");
+    LOG("%s: %zu/%d replicas ok; aggregate decode %.2f t/s (max-span) / %.2f t/s (e2e drain %.3fs)\n",
+        __func__, ok_reps, n_rep, agg_tps_max, agg_tps_e2e, run.seconds);
+
+    // teardown order: draft contexts first, then the pool (joins workers, frees target contexts).
+    drafts.clear();
+    pool.reset();
+    llama_backend_free();
+    return ok_reps == (size_t) n_rep ? 0 : 1;
+}
 
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
@@ -54,14 +308,13 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    // max number of parallel drafting sequences (i.e. tree branches)
-    const int n_seq_dft = params.n_parallel;
-
-    // probability threshold for splitting a draft branch (only for n_seq_dft > 1)
-    const float p_draft_split = params.speculative.draft.p_split;
-
-    std::default_random_engine rng(params.sampling.seed == LLAMA_DEFAULT_SEED ? std::random_device()() : params.sampling.seed);
-    std::uniform_real_distribution<> u_dist;
+    // data-parallel path: N (target+draft) replicas run spec-decode streams concurrently. engages when
+    // the orchestrator is active (-dp > 1) OR a strong-scaling shard size is given (--dp-chunk-chars > 0,
+    // which also enables the n_rep==1 serial baseline). plain single-stream (no -dp, no chunk) falls
+    // through to the unchanged path below.
+    if (orchestrator_dp_active(params) || params.dp_chunk_chars > 0) {
+        return speculative_dp(params);
+    }
 
     // init llama.cpp
     llama_backend_init();
@@ -156,6 +409,32 @@ int main(int argc, char ** argv) {
         }
     }
 
+    const spec_stream_stats st = run_spec_stream(ctx_tgt, ctx_dft, model_tgt, model_dft, params, /*print=*/true);
+
+    llama_backend_free();
+
+    LOG("\n\n");
+
+    return st.ok ? 0 : 1;
+}
+
+// Definition of the single-stream runner forward-declared above. The body below is the original
+// single-stream loop verbatim (only the user-facing prints are gated by `print`), so the single-stream
+// path stays byte-identical; the DP path calls it once per replica with print=false.
+static spec_stream_stats run_spec_stream(
+        llama_context * ctx_tgt, llama_context * ctx_dft,
+        const llama_model * model_tgt, const llama_model * model_dft,
+        common_params params, bool print) {
+    spec_stream_stats stats;
+
+    const int   n_seq_dft     = params.n_parallel;
+    const float p_draft_split = params.speculative.draft.p_split;
+
+    std::default_random_engine rng(params.sampling.seed == LLAMA_DEFAULT_SEED ? std::random_device()() : params.sampling.seed);
+    std::uniform_real_distribution<> u_dist;
+
+    const llama_vocab * vocab_tgt = llama_model_get_vocab(model_tgt);
+
     auto * mem_tgt = llama_get_memory(ctx_tgt);
     auto * mem_dft = llama_get_memory(ctx_dft);
 
@@ -168,13 +447,15 @@ int main(int argc, char ** argv) {
 
     if ((int) inp.size() > max_tokens_list_size) {
         LOG_ERR("%s: prompt too long (%d tokens, max %d)\n", __func__, (int) inp.size(), max_tokens_list_size);
-        return 1;
+        return stats;
     }
 
-    LOG("\n\n");
+    if (print) {
+        LOG("\n\n");
 
-    for (auto id : inp) {
-        LOG("%s", common_token_to_piece(ctx_tgt, id).c_str());
+        for (auto id : inp) {
+            LOG("%s", common_token_to_piece(ctx_tgt, id).c_str());
+        }
     }
 
     const int n_input = inp.size();
@@ -415,15 +696,19 @@ int main(int argc, char ** argv) {
                     ++n_past_tgt;
                     ++n_past_dft;
                     ++i_dft;
+                    if (print) {
                     if (params.use_color) {
                         // Color token according to its origin sequence
                         LOG("\u001b[%dm%s\u001b[37m", (36 - s_keep % 6), token_str.c_str());
                     } else {
                         LOG("%s", token_str.c_str());
                     }
+                    }
                     continue;
                 } else {
-                    LOG("%s", token_str.c_str());
+                    if (print) {
+                        LOG("%s", token_str.c_str());
+                    }
                     break;
                 }
             }
@@ -624,26 +909,28 @@ int main(int argc, char ** argv) {
 
     auto t_dec_end = ggml_time_us();
 
-    LOG("\n\n");
+    if (print) {
+        LOG("\n\n");
 
-    LOG_INF("encoded %4d tokens in %8.3f seconds, speed: %8.3f t/s\n", n_input,   (t_enc_end - t_enc_start) / 1e6f, inp.size() / ((t_enc_end - t_enc_start) / 1e6f));
-    LOG_INF("decoded %4d tokens in %8.3f seconds, speed: %8.3f t/s\n", n_predict, (t_dec_end - t_dec_start) / 1e6f, n_predict  / ((t_dec_end - t_dec_start) / 1e6f));
+        LOG_INF("encoded %4d tokens in %8.3f seconds, speed: %8.3f t/s\n", n_input,   (t_enc_end - t_enc_start) / 1e6f, inp.size() / ((t_enc_end - t_enc_start) / 1e6f));
+        LOG_INF("decoded %4d tokens in %8.3f seconds, speed: %8.3f t/s\n", n_predict, (t_dec_end - t_dec_start) / 1e6f, n_predict  / ((t_dec_end - t_dec_start) / 1e6f));
 
-    LOG_INF("\n");
-    LOG_INF("n_draft   = %d\n", n_draft);
-    LOG_INF("n_predict = %d\n", n_predict);
-    LOG_INF("n_drafted = %d\n", n_drafted);
-    LOG_INF("n_accept  = %d\n", n_accept);
-    LOG_INF("accept    = %.3f%%\n", 100.0f * n_accept / n_drafted);
+        LOG_INF("\n");
+        LOG_INF("n_draft   = %d\n", n_draft);
+        LOG_INF("n_predict = %d\n", n_predict);
+        LOG_INF("n_drafted = %d\n", n_drafted);
+        LOG_INF("n_accept  = %d\n", n_accept);
+        LOG_INF("accept    = %.3f%%\n", 100.0f * n_accept / n_drafted);
 
-    LOG_INF("\n");
-    LOG_INF("draft:\n\n");
-    // TODO: print sampling/grammar timings for all drafts
-    llama_perf_context_print(ctx_dft);
+        LOG_INF("\n");
+        LOG_INF("draft:\n\n");
+        // TODO: print sampling/grammar timings for all drafts
+        llama_perf_context_print(ctx_dft);
 
-    LOG_INF("\n");
-    LOG_INF("target:\n\n");
-    common_perf_print(ctx_tgt, smpl);
+        LOG_INF("\n");
+        LOG_INF("target:\n\n");
+        common_perf_print(ctx_tgt, smpl);
+    }
 
     common_sampler_free(smpl);
     for (int s = 0; s < n_seq_dft; ++s) {
@@ -651,10 +938,14 @@ int main(int argc, char ** argv) {
     }
 
     llama_batch_free(batch_dft);
+    llama_batch_free(batch_tgt);
 
-    llama_backend_free();
-
-    LOG("\n\n");
-
-    return 0;
+    stats.n_input   = n_input;
+    stats.n_predict = n_predict;
+    stats.n_drafted = n_drafted;
+    stats.n_accept  = n_accept;
+    stats.t_enc_s   = (t_enc_end - t_enc_start) / 1e6;
+    stats.t_dec_s   = (t_dec_end - t_dec_start) / 1e6;
+    stats.ok        = true;
+    return stats;
 }

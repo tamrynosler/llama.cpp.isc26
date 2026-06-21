@@ -1,7 +1,8 @@
 # Orchestrator Slurm test scripts
 
 Benchmark / verification jobs for the data-parallel orchestrator, run on one
-node of the target cluster (4x H100). Logs land in `results/<job>-<jobid>/`.
+or more nodes of the target cluster (4x H100 per node). Logs land in
+`results/<job>-<jobid>/`.
 
 ## Scripts
 
@@ -10,6 +11,9 @@ node of the target cluster (4x H100). Logs land in `results/<job>-<jobid>/`.
 | `baseline-original.slurm` | original upstream `~/llama.cpp` | 3 models, 1 GPU, default perplexity. The reference numbers. |
 | `dp-orchestrator.slurm`   | this fork `~/llama.cpp.isc26` | per model: 1 GPU default, 1 GPU matched (`-b $CTX`), 4 GPUs `--data-parallel 4`. |
 | `dp-batched-bench.slurm`  | this fork `~/llama.cpp.isc26` | per model: 1 GPU baseline vs 4 GPUs `--data-parallel 4` batched-bench. The GPU-bound throughput showcase; compare the DP `ALL` row against the 1-GPU row. No input dataset (random tokens). |
+| `dp-multinode-srun.slurm` | this fork `~/llama.cpp.isc26` | **multi-node (prototype).** `srun` fans the single-node DP sweep to every node; `aggregate-multinode.py` sums per-node throughput offline. RPC-free, no in-binary coordination. Job 453 = 2.00x on 2 nodes. |
+| `dp-batched-bench-cluster.slurm` | this fork `~/llama.cpp.isc26` | **multi-node (C++-native).** Same workload as the prototype, but coordination + aggregation happen **in-binary** via the MPI `cluster_link` (`srun --mpi=pmix`, one rank per node). No python. Output carries per-`NODE` rows + a `CL` cluster row. Requires the `-DLLAMA_ORCH_MPI=ON` build. |
+| `dp-speculative.slurm` | this fork `~/llama.cpp.isc26` | **speculative decoding + DP.** per (target,draft) pair + draft length: 1 GPU single spec stream vs 4 GPUs `--data-parallel 4` (one target+draft pair per GPU). Combines the spec speedup with the replica speedup; compare the DP `ALL`-row decode t/s vs the 1-GPU `decoded … t/s`, acceptance% unchanged. Single-node, no MPI. |
 
 Fill in the `MODELS`, repo paths, and `INPUT` variables at the top of each
 script (use the **same 3 models** in both). Build the relevant repo with
@@ -20,7 +24,9 @@ script (use the **same 3 models** in both). Build the relevant repo with
 - **No GRES.** Every node has 4 GPUs; we pick them with `CUDA_VISIBLE_DEVICES`.
   The scripts deliberately do **not** use `#SBATCH --gres`.
 - Modules via lmod: `ml gcc cuda` (pin versions if your site requires, e.g.
-  `ml gcc/15.2 cuda/13.1`).
+  `ml gcc/15.2 cuda/13.1`). The C++-native cluster script also needs MPI:
+  `ml gcc hpcx cuda` (HPC-X = Open MPI + UCX) and a build with
+  `-DLLAMA_ORCH_MPI=ON`. Launch it with `srun --mpi=pmix` (fall back to `pmi2`).
 - `-ngl 99` is required for GPU offload. The orchestrator **warns** if `-ngl` is
   left at auto but does **not** silently force it, so the scripts set it explicitly.
 
