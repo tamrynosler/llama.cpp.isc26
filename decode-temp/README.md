@@ -65,6 +65,16 @@ nsys names the dominant kernels.
 sbatch decode-temp/decode-profile.slurm           # -> decode-profile-<jobid>/*.summary.txt
 ```
 
+### `decode-profile-ncu.slurm` — per-kernel drill (L2b)
+Nsight Compute on the decode kernels nsys flagged (`mul_mat_vec_q`, `quantize_q8_1`,
+`rms_norm_f32`, `flash_attn_ext_f16`). Reports Memory vs Compute throughput (% of peak) and
+achieved DRAM GB/s, to decide whether the GEMV is bandwidth-saturated (reduce bytes) or has
+headroom (optimize the kernel). Graphs disabled for deterministic launch skip/count.
+
+```bash
+sbatch decode-temp/decode-profile-ncu.slurm       # -> decode-ncu-<jobid>/dense_decode.details.txt
+```
+
 Outputs/logs write to the launch CWD (not into the repo tree). Copy them back to the parent
 `cluster-reports/` per the project workflow.
 
