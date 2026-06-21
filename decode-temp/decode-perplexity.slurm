@@ -30,7 +30,9 @@ set -uo pipefail
 REPO="$HOME/llama.cpp.isc26"
 BIN="$REPO/build/bin/llama-perplexity"
 DENSE="/shared/llms/models/Qwen2.5-14B-Instruct-Q4_0.gguf"
-DATASET="$HOME/datasets/wikitext-2-raw/wiki.test.raw"   # adjust if it lives elsewhere
+# shared filesystem (same root as the models). Override at submit time if the filename differs:
+#   DATASET=/shared/llms/datasets/<exact>.raw sbatch decode-temp/decode-perplexity.slurm
+DATASET="${DATASET:-/shared/llms/datasets/wikitext-2-raw/wiki.test.raw}"
 GPU_IDX=0
 CTX=4096            # cache reaches this depth within a chunk -> KV-quant quality effect shows
 CHUNKS=20           # quick; -1 = full corpus (slow). raise for a tighter estimate
