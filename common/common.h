@@ -468,22 +468,6 @@ struct common_params {
 
     enum llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER; // how to split the model across GPUs
 
-    // data-parallel (orchestrator): N independent model replicas dispatched concurrently
-    int32_t          n_data_parallel = 1; // number of replicas; 1 = orchestrator off (no-op)
-    std::vector<int> dp_devices;          // flat --dp-devices (e.g. 0,0,1,1): one pinned replica per entry
-    // grouped --dp-devices (e.g. 0+1,2+3): one replica per group, multi-GPU groups split across their
-    // devices (the model-too-big escape hatch). populated instead of dp_devices when any '+' is used.
-    std::vector<std::vector<int>> dp_device_groups;
-    enum llama_split_mode dp_split_mode = LLAMA_SPLIT_MODE_LAYER; // how a multi-GPU replica is split
-    // count-based placement (alternative to listing devices): R replicas on each of GPUs 0..D-1.
-    int32_t dp_num_devices         = 0; // D; 0 = unset
-    int32_t dp_replicas_per_device = 0; // R; 0 = unset (treated as 1 when D is set)
-    // data-parallel speculative-decode mode (consumed by llama-speculative):
-    bool    dp_weak       = false; // weak scaling: every replica runs the IDENTICAL stream (diagnostic);
-                                   // default is strong scaling (distinct corpus shards per replica)
-    int32_t dp_chunk_chars = 0;    // strong scaling: bytes per corpus shard; >0 also engages the batch
-                                   // path at any replica count (so -dp 1 gives the serial baseline)
-
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;
 

@@ -3,7 +3,6 @@
 #include "fit.h"
 #include "log.h"
 #include "llama.h"
-#include "orchestrator.h"
 
 #include <algorithm>
 #include <array>
@@ -12,7 +11,6 @@
 #include <clocale>
 #include <cmath>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <fstream>
@@ -22,31 +20,9 @@
 #include <thread>
 #include <vector>
 
-#if defined(__linux__)
-#include <sched.h>
-#endif
-
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267) // possible loss of data
 #endif
-
-// Number of CPUs actually available to this process. On a shared HPC node
-// std::thread::hardware_concurrency() reports the whole node, not the SLURM/
-// cgroup allocation, so sizing worker pools from it oversubscribes badly (e.g.
-// 112 threads on a 16-core allocation). Prefer the process affinity mask.
-static unsigned int usable_cpu_count() {
-#if defined(__linux__)
-    cpu_set_t set;
-    if (sched_getaffinity(0, sizeof(set), &set) == 0) {
-        const int n = CPU_COUNT(&set);
-        if (n > 0) {
-            return (unsigned int) n;
-        }
-    }
-#endif
-    const unsigned int n = std::thread::hardware_concurrency();
-    return n ? n : 1;
-}
 
 struct results_perplexity {
     std::vector<llama_token> tokens;
@@ -540,7 +516,7 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
 
     LOG_INF("%s: calculating perplexity over %d chunks, n_ctx=%d, batch_size=%d, n_seq=%d\n", __func__, n_chunk, n_ctx, n_batch, n_seq);
 
-    std::vector<std::thread> workers(usable_cpu_count() - 1);
+    std::vector<std::thread> workers(std::thread::hardware_concurrency() - 1);
 
     std::vector<uint16_t> log_probs;
     if (!params.logits_file.empty()) {
@@ -565,155 +541,6 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
     // process the entire prompt.
     const int first = n_ctx/2;
 
-    // Optional host-side profiling: split per-chunk wall-clock into GPU decode
-    // vs CPU logit post-processing, to verify whether the CPU pass is actually
-    // a meaningful fraction before optimising it. Enabled by setting the env
-    // var LLAMA_PPL_PROFILE (to any value). Off by default; when on it only adds
-    // an llama_synchronize + timing per chunk, so it cannot change the PPL.
-    const bool ppl_profile = std::getenv("LLAMA_PPL_PROFILE") != nullptr;
-    double prof_decode_s   = 0.0;
-    double prof_postproc_s = 0.0;
-
-    // P5: overlap each chunk's CPU log-softmax post-processing with the GPU
-    // decode of the NEXT chunk (double-buffered logits), so the GPU is not idle
-    // during the host NLL pass. Opt-in via the env var LLAMA_PPL_OVERLAP; off by
-    // default so the proven serial path is untouched. Limited to the common
-    // single-batch case (num_batches == 1) and the normal (non --logits-file)
-    // path; otherwise the serial path below runs unchanged. Costs two extra
-    // host-side logit buffers (~2 x (n_ctx-first) x n_vocab floats).
-    const bool ppl_overlap = std::getenv("LLAMA_PPL_OVERLAP") != nullptr
-                             && num_batches == 1 && params.logits_file.empty();
-
-    // Per-seq logit post-processing (NLL accumulation + running-PPL log). Shared
-    // by the serial and overlap paths so they stay byte-for-byte equivalent.
-    auto process_seq = [&](int ci, int seq, const float * all_logits) {
-        const int cstart = ci * n_ctx;
-        llama_token * tokens_data = tokens.data() + cstart + seq*n_ctx + first;
-        if (!params.logits_file.empty()) {
-            process_logits(logits_stream, n_vocab, all_logits,
-                    tokens_data, n_ctx - 1 - first,
-                    workers, log_probs, nll, nll2);
-        } else {
-            process_logits(n_vocab, all_logits,
-                    tokens_data, n_ctx - 1 - first,
-                    workers, nll, nll2,
-                    logit_history.data() + cstart + seq*n_ctx + first,
-                    prob_history.data()  + cstart + seq*n_ctx + first);
-        }
-        count += n_ctx - first - 1;
-
-        // perplexity is e^(average negative log-likelihood)
-        if (params.ppl_output_type == 0) {
-            LOG("[%d]%.4lf,", ci + seq + 1, std::exp(nll / count));
-        } else {
-            double av = nll/count;
-            double av2 = nll2/count - av*av;
-            if (av2 > 0) {
-                av2 = sqrt(av2/(count-1));
-            }
-            LOG("%8d  %.4lf  %4lf  %4lf\n", ci*n_ctx, std::exp(nll / count), av, av2);
-        }
-    };
-
-    if (ppl_overlap) {
-        // Fill the batch for chunk `ci` (a single sub-batch, since num_batches==1)
-        // and decode it WITHOUT synchronising, so the GPU can run it while the CPU
-        // post-processes the previous chunk. Mirrors the serial batch fill exactly.
-        auto decode_chunk = [&](int ci) -> bool {
-            const int cstart = ci * n_ctx;
-            const int nsb    = std::min(n_seq, n_chunk - ci);
-            llama_memory_clear(llama_get_memory(ctx), true);
-            batch.n_tokens = 0;
-            for (int seq = 0; seq < nsb; seq++) {
-                const int seq_start = cstart + seq*n_ctx;
-                const auto token_org = tokens[seq_start];
-                if (add_bos) {
-                    tokens[seq_start] = llama_vocab_bos(vocab);
-                }
-                for (int k = 0; k < n_ctx; ++k) {
-                    const int idx = seq*n_ctx + k;
-                    batch.token   [idx]    = tokens[seq_start + k];
-                    batch.pos     [idx]    = k;
-                    batch.n_seq_id[idx]    = 1;
-                    batch.seq_id  [idx][0] = seq;
-                    batch.logits  [idx]    = k >= first ? 1 : 0;
-                }
-                batch.n_tokens += n_ctx;
-                tokens[seq_start] = token_org;
-            }
-            return llama_decode(ctx, batch) == 0;
-        };
-
-        // Copy chunk `ci`'s output-window logits out of the context (this read is
-        // the synchronisation point) so the next decode can overwrite them safely.
-        const size_t rows = (size_t)(n_ctx - first);
-        auto copy_chunk_logits = [&](int ci, std::vector<float> & dst) {
-            const int nsb = std::min(n_seq, n_chunk - ci);
-            dst.resize(rows * (size_t) n_vocab * nsb);
-            for (int seq = 0; seq < nsb; seq++) {
-                const float * src = llama_get_logits_ith(ctx, seq*n_ctx + first);
-                std::copy(src, src + rows * (size_t) n_vocab,
-                          dst.data() + (size_t) seq * rows * (size_t) n_vocab);
-            }
-        };
-
-        std::vector<float> buf[2];
-        int cur = 0;
-
-        if (!decode_chunk(0)) {
-            LOG_INF("%s : failed to decode\n", __func__);
-            return {tokens, -1, logit_history, prob_history};
-        }
-        copy_chunk_logits(0, buf[cur]);
-
-        for (int i = 0; i < n_chunk; i += n_seq) {
-            const int  nxt     = i + n_seq;
-            const auto t_start = std::chrono::high_resolution_clock::now();
-
-            // issue the next chunk's decode; the GPU runs it while the CPU below
-            // post-processes the current chunk's already-copied logits.
-            if (nxt < n_chunk) {
-                if (!decode_chunk(nxt)) {
-                    LOG_INF("%s : failed to decode\n", __func__);
-                    return {tokens, -1, logit_history, prob_history};
-                }
-            }
-
-            const int  n_seq_batch = std::min(n_seq, n_chunk - i);
-            const auto t_pp0       = std::chrono::high_resolution_clock::now();
-            for (int seq = 0; seq < n_seq_batch; seq++) {
-                process_seq(i, seq, buf[cur].data() + (size_t) seq * rows * (size_t) n_vocab);
-            }
-            if (ppl_profile) {
-                prof_postproc_s += std::chrono::duration<double>(
-                    std::chrono::high_resolution_clock::now() - t_pp0).count();
-            }
-
-            // harvest the next chunk; with overlap working most of its decode
-            // already completed during the post-proc above, so this waits little.
-            if (nxt < n_chunk) {
-                const auto t_h0 = std::chrono::high_resolution_clock::now();
-                copy_chunk_logits(nxt, buf[1 - cur]);
-                cur ^= 1;
-                if (ppl_profile) {
-                    prof_decode_s += std::chrono::duration<double>(
-                        std::chrono::high_resolution_clock::now() - t_h0).count();
-                }
-            }
-
-            if (i == 0) {
-                const float t_total = std::chrono::duration<float>(
-                    std::chrono::high_resolution_clock::now() - t_start).count();
-                LOG_INF("%s: %.2f seconds per pass - ETA ", __func__, t_total);
-                int total_seconds = (int)(t_total*n_chunk/n_seq);
-                if (total_seconds >= 60*60) {
-                    LOG("%d hours ", total_seconds / (60*60));
-                    total_seconds = total_seconds % (60*60);
-                }
-                LOG("%.2f minutes\n", total_seconds / 60.0);
-            }
-        }
-    } else {
     for (int i = 0; i < n_chunk; i += n_seq) {
         const int start =     i * n_ctx;
         const int end   = start + n_ctx;
@@ -770,13 +597,6 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
             }
         }
 
-        if (ppl_profile) {
-            // attribute GPU decode time for this chunk (t_start was taken at the
-            // top of the iteration, just before the KV clear + decode batches).
-            llama_synchronize(ctx);
-            prof_decode_s += std::chrono::duration<double>(
-                std::chrono::high_resolution_clock::now() - t_start).count();
-        }
 
         if (i == 0) {
             llama_synchronize(ctx);
@@ -791,29 +611,39 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
             LOG("%.2f minutes\n", total_seconds / 60.0);
         }
 
-        const auto t_pp0 = std::chrono::high_resolution_clock::now();
-
         for (int seq = 0; seq < n_seq_batch; seq++) {
             const float * all_logits = num_batches > 1 ? logits.data() : llama_get_logits_ith(ctx, seq*n_ctx + first);
-            process_seq(i, seq, all_logits);
-        }
 
-        if (ppl_profile) {
-            prof_postproc_s += std::chrono::duration<double>(
-                std::chrono::high_resolution_clock::now() - t_pp0).count();
+            llama_token * tokens_data = tokens.data() + start + seq*n_ctx + first;
+            if (!params.logits_file.empty()) {
+                process_logits(logits_stream, n_vocab, all_logits,
+                        tokens_data, n_ctx - 1 - first,
+                        workers, log_probs, nll, nll2);
+            } else {
+                process_logits(n_vocab, all_logits,
+                        tokens_data, n_ctx - 1 - first,
+                        workers, nll, nll2,
+                        logit_history.data() + start + seq*n_ctx + first,
+                        prob_history.data()  + start + seq*n_ctx + first);
+            }
+            count += n_ctx - first - 1;
+
+            // perplexity is e^(average negative log-likelihood)
+            if (params.ppl_output_type == 0) {
+                LOG("[%d]%.4lf,", i + seq + 1, std::exp(nll / count));
+            } else {
+                double av = nll/count;
+                double av2 = nll2/count - av*av;
+                if (av2 > 0) {
+                    av2 = sqrt(av2/(count-1));
+                }
+                LOG("%8d  %.4lf  %4lf  %4lf\n", i*n_ctx, std::exp(nll / count), av, av2);
+            }
         }
 
         logits.clear();
     }
-    }
     LOG("\n");
-
-    if (ppl_profile) {
-        const double t_sum = prof_decode_s + prof_postproc_s;
-        LOG_INF("%s: [profile] GPU decode = %.3fs (%.1f%%), CPU post-proc = %.3fs (%.1f%%) over %d chunks\n",
-                __func__, prof_decode_s, t_sum > 0.0 ? 100.0*prof_decode_s/t_sum : 0.0,
-                prof_postproc_s, t_sum > 0.0 ? 100.0*prof_postproc_s/t_sum : 0.0, count > 0 ? n_chunk : 0);
-    }
 
     nll2 /= count;
     nll /= count;
@@ -827,195 +657,6 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
     }
 
     llama_batch_free(batch);
-
-    return {tokens, ppl, logit_history, prob_history};
-}
-
-// data-parallel perplexity (S9). Same per-token NLL math as perplexity() above, but each chunk
-// is decoded on one of N independent replicas via the orchestrator pool; the per-chunk partials
-// are then reduced in chunk order on this thread, so the reported PPL matches the single-replica
-// baseline. dp <= 1 never reaches here, so perplexity() stays byte-for-byte unchanged.
-//
-// Each replica stacks n_seq chunks per llama_decode as parallel sequences (n_seq = n_parallel =
-// n_batch / n_ctx, controlled by -b), exactly like the single-replica path's in-context batching.
-// n_seq = 1 (small -b) collapses to one chunk per decode.
-static results_perplexity perplexity_dp(orchestrator_pool & pool, const common_params & params, const int32_t n_ctx) {
-    const int n_rep = pool.size();
-    const int n_seq = std::max(1, params.n_parallel); // chunks stacked per replica per decode (from -b)
-
-    const llama_model * model = pool.model();
-    const llama_vocab * vocab = llama_model_get_vocab(model);
-
-    const bool add_bos = llama_vocab_get_add_bos(vocab);
-    GGML_ASSERT(!llama_vocab_get_add_eos(vocab));
-
-    LOG_INF("%s: tokenizing the input ..\n", __func__);
-    std::vector<llama_token> tokens = common_tokenize(vocab, params.prompt, true);
-
-    if (int(tokens.size()) < 2*n_ctx) {
-        LOG_ERR("%s: you need at least %d tokens to evaluate perplexity with a context of %d\n",
-                __func__, 2*n_ctx, n_ctx);
-        LOG_ERR("%s: the data file you provided tokenizes to only %zu tokens\n", __func__, tokens.size());
-        return {std::move(tokens), 0., {}, {}};
-    }
-
-    std::vector<float> logit_history(tokens.size());
-    std::vector<float> prob_history(tokens.size());
-
-    const int n_chunk_max = tokens.size() / n_ctx;
-    const int n_chunk     = params.n_chunks < 0 ? n_chunk_max : std::min(params.n_chunks, n_chunk_max);
-    const int n_vocab     = llama_vocab_n_tokens(vocab);
-    const int n_batch     = params.n_batch;
-    const int num_batches = (n_ctx + n_batch - 1) / n_batch;
-    const int first       = n_ctx/2;
-
-    LOG_INF("%s: calculating perplexity over %d chunks, %d replicas x %d seq, n_ctx=%d, batch_size=%d\n",
-            __func__, n_chunk, n_rep, n_seq, n_ctx, n_batch);
-
-    // per-replica scratch, indexed by replica_index. each orchestrator worker touches only its own
-    // slot, so this is race-free without locking (the pool already serializes access to each ctx).
-    std::vector<llama_batch> batches(n_rep);
-    std::vector<std::vector<std::thread>> rep_workers(n_rep);
-    const unsigned hw = usable_cpu_count();
-    // split the host cores across replicas: each replica's process_logits pool gets ~cores/n_rep
-    // workers (+1 calling thread), so the N replicas reducing NLL concurrently don't oversubscribe
-    // the CPU. process_logits (host log_softmax over the full vocab) is the bottleneck for
-    // perplexity, so a 4x-oversubscribed pool only adds context-switch + thread-churn overhead.
-    const unsigned per_rep = std::max(1u, (hw > 1 ? hw - 1 : 1) / (unsigned) n_rep);
-    for (int r = 0; r < n_rep; ++r) {
-        batches[r] = llama_batch_init(std::min(n_batch, n_ctx*n_seq), 0, 1);
-        rep_workers[r].resize(per_rep);
-    }
-
-    // one result slot per chunk, written only by the job that decodes that chunk (distinct slot
-    // per job, as the orchestrator contract requires).
-    struct chunk_result { double nll = 0.0; double nll2 = 0.0; int count = 0; bool ok = false; };
-    std::vector<chunk_result> results(n_chunk);
-
-    // enqueue one job per group of up to n_seq chunks; the pool runs groups across replicas.
-    // submit() applies backpressure when the queue fills, and we are the only (non-worker)
-    // producer, so this is safe for any chunk count.
-    for (int i = 0; i < n_chunk; i += n_seq) {
-        pool.submit([&, i](llama_context * ctx, int r) -> bool {
-            const int start       = i * n_ctx;
-            const int end         = start + n_ctx;
-            const int n_seq_batch = std::min(n_seq, n_chunk - i);
-
-            llama_batch & batch = batches[r];
-
-            // each group starts from an empty KV cache.
-            llama_memory_clear(llama_get_memory(ctx), true);
-
-            std::vector<float> logits;
-            if (num_batches > 1) {
-                logits.reserve(size_t(n_ctx) * n_vocab);
-            }
-
-            for (int j = 0; j < num_batches; ++j) {
-                const int batch_start = start + j*n_batch;
-                const int batch_size  = std::min(end - batch_start, n_batch);
-
-                int n_outputs = 0;
-
-                batch.n_tokens = 0;
-                for (int seq = 0; seq < n_seq_batch; seq++) {
-                    const int seq_start = batch_start + seq*n_ctx;
-
-                    // add a BOS token to the first batch of each chunk, then restore (the batch
-                    // keeps its own copy, so restoring before decode is safe). chunk ranges are
-                    // disjoint across groups, so concurrent jobs never touch the same token index.
-                    const llama_token token_org = tokens[seq_start];
-                    if (add_bos && j == 0) {
-                        tokens[seq_start] = llama_vocab_bos(vocab);
-                    }
-
-                    for (int k = 0; k < batch_size; ++k) {
-                        const int idx = seq*n_ctx + k;
-                        batch.token   [idx]    = tokens[seq_start + k];
-                        batch.pos     [idx]    = j*n_batch + k;
-                        batch.n_seq_id[idx]    = 1;
-                        batch.seq_id  [idx][0] = seq;
-                        batch.logits  [idx]    = batch.pos[idx] >= first ? 1 : 0;
-                        n_outputs += batch.logits[idx] != 0;
-                    }
-                    batch.n_tokens += batch_size;
-
-                    tokens[seq_start] = token_org;
-                }
-
-                if (llama_decode(ctx, batch)) {
-                    return false; // counted as a failed group; reduction aborts below
-                }
-
-                if (num_batches > 1 && n_outputs > 0) {
-                    const float * batch_logits = llama_get_logits(ctx);
-                    logits.insert(logits.end(), batch_logits, batch_logits + size_t(n_outputs) * n_vocab);
-                }
-            }
-
-            for (int seq = 0; seq < n_seq_batch; seq++) {
-                const float * all_logits = num_batches > 1
-                    ? logits.data() : llama_get_logits_ith(ctx, seq*n_ctx + first);
-
-                chunk_result & cr = results[i + seq];
-                process_logits(n_vocab, all_logits,
-                        tokens.data() + start + seq*n_ctx + first, n_ctx - 1 - first,
-                        rep_workers[r], cr.nll, cr.nll2,
-                        logit_history.data() + start + seq*n_ctx + first,
-                        prob_history.data()  + start + seq*n_ctx + first);
-                cr.count = n_ctx - first - 1;
-                cr.ok    = true;
-            }
-            return true;
-        });
-    }
-
-    const orchestrator_run_stats st = pool.drain();
-
-    for (int r = 0; r < n_rep; ++r) {
-        llama_batch_free(batches[r]);
-    }
-
-    // reduce per-chunk partials in chunk order - the same accumulation order as the single-replica
-    // path - so the reported PPL matches the baseline. a failed chunk aborts rather than reporting a
-    // PPL computed from a partial sum (a silently-wrong number is the worst outcome for this tool).
-    double nll  = 0.0;
-    double nll2 = 0.0;
-    int count   = 0;
-    for (int i = 0; i < n_chunk; ++i) {
-        if (!results[i].ok) {
-            LOG_ERR("%s: chunk %d failed to decode - aborting\n", __func__, i);
-            return {tokens, -1, logit_history, prob_history};
-        }
-        nll   += results[i].nll;
-        nll2  += results[i].nll2;
-        count += results[i].count;
-
-        if (params.ppl_output_type == 0) {
-            LOG("[%d]%.4lf,", i + 1, std::exp(nll / count));
-        } else {
-            double av  = nll/count;
-            double av2 = nll2/count - av*av;
-            if (av2 > 0) {
-                av2 = sqrt(av2/(count-1));
-            }
-            LOG("%8d  %.4lf  %4lf  %4lf\n", i*n_ctx, std::exp(nll / count), av, av2);
-        }
-    }
-    LOG("\n");
-
-    nll2 /= count;
-    nll  /= count;
-    const double ppl = exp(nll);
-    nll2 -= nll * nll;
-    if (nll2 > 0) {
-        nll2 = sqrt(nll2/(count-1));
-        LOG_INF("Final estimate: PPL = %.4lf +/- %.5lf\n", ppl, nll2*ppl);
-    } else {
-        LOG_ERR("Unexpected negative standard deviation of log(prob)\n");
-    }
-
-    LOG_INF("%s: %d chunks across %d replicas in %.2f s\n", __func__, n_chunk, n_rep, st.seconds);
 
     return {tokens, ppl, logit_history, prob_history};
 }
@@ -1233,7 +874,7 @@ static void hellaswag_score(llama_context * ctx, const common_params & params) {
 
     std::vector<std::pair<size_t, llama_token>> eval_pairs;
     std::vector<float> eval_results;
-    std::vector<std::thread> workers(usable_cpu_count());
+    std::vector<std::thread> workers(std::thread::hardware_concurrency());
 
     for (size_t i0 = 0; i0 < hs_task_count; i0++) {
         int n_cur = 0;
@@ -1531,7 +1172,7 @@ static void winogrande_score(llama_context * ctx, const common_params & params) 
 
     std::vector<std::pair<size_t, llama_token>> eval_pairs;
     std::vector<float> eval_results;
-    std::vector<std::thread> workers(usable_cpu_count());
+    std::vector<std::thread> workers(std::thread::hardware_concurrency());
 
     int n_correct = 0;
     int n_done    = 0;
@@ -1838,7 +1479,7 @@ static void multiple_choice_score(llama_context * ctx, const common_params & par
                 }
             }
         };
-        size_t max_thread = usable_cpu_count();
+        size_t max_thread = std::thread::hardware_concurrency();
         max_thread = std::min(max_thread, (tasks.size() + K_TOKEN_CHUNK - 1)/K_TOKEN_CHUNK);
         std::vector<std::thread> workers(max_thread-1);
         for (auto& w : workers) w = std::thread(prepare);
@@ -1884,7 +1525,7 @@ static void multiple_choice_score(llama_context * ctx, const common_params & par
 
     std::vector<std::pair<size_t, llama_token>> eval_pairs;
     std::vector<float> eval_results;
-    std::vector<std::thread> workers(usable_cpu_count());
+    std::vector<std::thread> workers(std::thread::hardware_concurrency());
     std::vector<int> batch_indeces;
 
     int n_done = 0;
@@ -2124,7 +1765,7 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
 
     LOG_INF("%s: computing over %d chunks, n_ctx=%u, batch_size=%d, n_seq=%d\n", __func__, n_chunk, n_ctx, n_batch, n_seq);
 
-    std::vector<std::thread> workers(usable_cpu_count() - 1);
+    std::vector<std::thread> workers(std::thread::hardware_concurrency() - 1);
 
     auto mean_and_uncertainty = [] (double sum, double sum2, size_t count) {
         if (count < 1) {
@@ -2405,45 +2046,6 @@ int llama_perplexity(int argc, char ** argv) {
 
     llama_backend_init();
     llama_numa_init(params.numa);
-
-    // ---- data-parallel path (S9) ----
-    // only the plain perplexity path is wired for DP; other scoring modes, strided PPL, and
-    // logits-file streaming fall back to the single-replica path below with a warning.
-    if (orchestrator_dp_active(params)) {
-        const bool dp_eligible =
-            !params.hellaswag && !params.winogrande && !params.multiple_choice &&
-            !params.kl_divergence && params.ppl_stride <= 0 && params.logits_file.empty();
-        if (dp_eligible) {
-            // params already carry the batched sizing computed above: n_parallel = n_batch/n_ctx
-            // sequences, n_ctx = n_parallel * (per-chunk n_ctx). Each replica is one such context and
-            // stacks n_parallel chunks per llama_decode - the batch size (-b) controls it.
-
-            // warn, don't override (matches the -sm/-mg convention): a data-parallel run wants
-            // weights on GPU, but we never silently change a value the user may have set.
-            if (params.n_gpu_layers == -1) {
-                LOG_WRN("%s: --data-parallel set but -ngl is auto; pass '-ngl all' to keep weights "
-                        "on GPU (a CPU-only data-parallel run will be slow)\n", __func__);
-            }
-
-            // resolve replica placement from the --dp-* flags (precedence in orchestrator_specs_from_params).
-            auto pool = orchestrator_make_pool(params, orchestrator_specs_from_params(params));
-            if (!pool) {
-                LOG_ERR("%s: failed to build the data-parallel replica pool\n", __func__);
-                llama_backend_free();
-                return 1;
-            }
-
-            LOG_INF("\n");
-            LOG_INF("%s\n", common_params_get_system_info(params).c_str());
-
-            const results_perplexity results = perplexity_dp(*pool, params, n_ctx);
-
-            LOG("\n");
-            llama_backend_free();
-            return results.ppl_value > 0.0 ? 0 : 1;
-        }
-        LOG_WRN("%s: --data-parallel is not yet wired for this mode; running single-replica\n", __func__);
-    }
 
     // load the model and apply lora adapter, if any
     auto llama_init = common_init_from_params(params);
