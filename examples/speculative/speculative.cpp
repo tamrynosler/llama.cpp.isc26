@@ -6,6 +6,12 @@
 #include "ggml-backend.h"
 #include "orchestrator.h"
 
+#ifdef LLAMA_ORCH_MPI
+#include "cluster.h"
+#else
+struct cluster_link; // fwd decl: cluster mode compiled out, the pointer stays null
+#endif
+
 #include <algorithm>
 #include <clocale>
 #include <condition_variable>
@@ -91,7 +97,7 @@ static bool any_gpu_device() {
 // DISTINCT work - not the same prompt duplicated. At n_rep==1 this is the single-GPU serial baseline.
 static int run_dp_strong(const common_params & params, orchestrator_pool & pool,
                          std::vector<common_init_result_ptr> & drafts,
-                         const llama_model * model_tgt, int n_rep) {
+                         const llama_model * model_tgt, int n_rep, cluster_link * link) {
     const int           chunk  = params.dp_chunk_chars > 0 ? params.dp_chunk_chars : 4096;
     const std::string & corpus = params.prompt;
 
@@ -104,24 +110,64 @@ static int run_dp_strong(const common_params & params, orchestrator_pool & pool,
     if (chunks.empty()) {
         chunks.push_back(corpus);
     }
-    const int M = (int) chunks.size();
-    LOG_INF("%s: strong scaling: %d distinct prompts (%d-byte shards) across %d replicas\n",
-            __func__, M, chunk, n_rep);
+    const int M_total = (int) chunks.size();
+
+    // cross-node partition: each node runs a static, non-overlapping stripe of the corpus (chunk i ->
+    // node i % n_nodes); there is NO cross-node work-stealing (intra-node stealing still balances the
+    // local replicas). The corpus is identical on every node (same -f on the shared FS), so the stripes
+    // tile the work with no inter-node traffic. Single-rank / non-MPI build -> n_nodes==1, rank==0 ->
+    // every chunk is local and the path is byte-identical to the single-node run.
+    int n_nodes = 1;
+    int rank    = 0;
+#ifdef LLAMA_ORCH_MPI
+    const bool cluster_mode = link && link->size() > 1;
+    if (cluster_mode) {
+        n_nodes = link->size();
+        rank    = link->rank();
+    }
+#else
+    const bool cluster_mode = false;
+    (void) link;
+#endif
+
+    std::vector<int> local_idx;                       // global chunk indices assigned to THIS node
+    for (int i = 0; i < M_total; ++i) {
+        if (i % n_nodes == rank) {
+            local_idx.push_back(i);
+        }
+    }
+    const int M = (int) local_idx.size();             // jobs on this node
+    if (cluster_mode) {
+        LOG_INF("%s: strong scaling (cluster): node %d/%d runs %d of %d distinct prompts across %d replicas\n",
+                __func__, rank, n_nodes, M, M_total, n_rep);
+    } else {
+        LOG_INF("%s: strong scaling: %d distinct prompts (%d-byte shards) across %d replicas\n",
+                __func__, M_total, chunk, n_rep);
+    }
 
     std::vector<spec_stream_stats> job_stats(M);          // distinct index per job -> race-free
     std::vector<int>               rep_jobs(n_rep, 0);    // each index written only by its own worker
     std::vector<long long>         rep_tokens(n_rep, 0);
 
-    for (int i = 0; i < M; ++i) {
-        pool.submit([&job_stats, &drafts, &rep_jobs, &rep_tokens, model_tgt, &params, &chunks, i]
+#ifdef LLAMA_ORCH_MPI
+    // align the timed-region start across nodes: no node begins submitting until all have finished
+    // loading + warming up (mirrors batched-bench's pre-sweep link->barrier()).
+    if (cluster_mode) {
+        link->barrier();
+    }
+#endif
+
+    for (int j = 0; j < M; ++j) {
+        const int i = local_idx[j];                   // global chunk index for this local job
+        pool.submit([&job_stats, &drafts, &rep_jobs, &rep_tokens, model_tgt, &params, &chunks, i, j]
                     (llama_context * ctx_tgt, int rr) -> bool {
             common_params jp = params;        // per-job copy (concurrent read-only copy of params is safe)
             jp.prompt = chunks[i];
-            job_stats[i] = run_spec_stream(ctx_tgt, drafts[rr]->context(),
+            job_stats[j] = run_spec_stream(ctx_tgt, drafts[rr]->context(),
                                            model_tgt, drafts[rr]->model(), jp, /*print=*/false);
             rep_jobs[rr]   += 1;
-            rep_tokens[rr] += job_stats[i].n_predict;
-            return job_stats[i].ok;
+            rep_tokens[rr] += job_stats[j].n_predict;
+            return job_stats[j].ok;
         });
     }
     const orchestrator_run_stats run = pool.drain();
@@ -139,7 +185,68 @@ static int run_dp_strong(const common_params & params, orchestrator_pool & pool,
             sum_job_time += s.t_enc_s + s.t_dec_s;
         }
     }
-    const double wall    = run.seconds;
+    const double wall = run.seconds;
+
+#ifdef LLAMA_ORCH_MPI
+    if (cluster_mode) {
+        // each node contributes one aggregate line; rank 0 reduces + prints. kilobytes, once per run.
+        const std::string blob = string_format("%d %lld %lld %lld %.9g %d %d\n",
+            n_rep, tot_predict, tot_drafted, tot_accept, wall, (int) ok_jobs, M);
+        const std::vector<std::string> gathered = link->gather(blob);
+
+        if (link->is_head()) {
+            LOG("\n");
+            LOG("%s: CLUSTER strong-scaling speculative decoding: %d nodes x %d replicas = %d (target+draft) pairs, %d distinct prompts\n",
+                __func__, n_nodes, n_rep, n_nodes * n_rep, M_total);
+            LOG("|%4s | %6s | %6s | %12s | %9s | %12s | %8s |\n",
+                "NODE", "pairs", "jobs", "gen tokens", "wall s", "decode t/s", "accept%");
+            LOG("|%4s-|-%6s-|-%6s-|-%12s-|-%9s-|-%12s-|-%8s-|\n",
+                "----", "------", "------", "------------", "---------", "------------", "--------");
+
+            double    cl_wall = 0.0;
+            long long cl_predict = 0, cl_drafted = 0, cl_accept = 0;
+            int       cl_pairs = 0, cl_jobs = 0, cl_ok = 0;
+            bool      parse_ok = true;
+            for (int nd = 0; nd < (int) gathered.size(); ++nd) {
+                int       nrep = 0, okj = 0, mj = 0;
+                long long pred = 0, draf = 0, acc = 0;
+                double    w = 0.0;
+                if (std::sscanf(gathered[nd].c_str(), "%d %lld %lld %lld %lf %d %d",
+                                &nrep, &pred, &draf, &acc, &w, &okj, &mj) != 7) {
+                    parse_ok = false;
+                    break;
+                }
+                const double node_tps = w    > 0.0 ? (double) pred / w : 0.0;
+                const double node_acc = draf > 0    ? 100.0 * (double) acc / (double) draf : 0.0;
+                LOG("|%4d | %6d | %6d | %12lld | %9.3f | %12.2f | %7.2f%% |\n",
+                    nd, nrep, okj, pred, w, node_tps, node_acc);
+                cl_wall     = std::max(cl_wall, w);
+                cl_predict += pred;
+                cl_drafted += draf;
+                cl_accept  += acc;
+                cl_pairs   += nrep;
+                cl_jobs    += mj;
+                cl_ok      += okj;
+            }
+            if (!parse_ok) {
+                LOG_ERR("%s: cluster reduce failed: a node aggregate blob did not parse\n", __func__);
+                return 1;
+            }
+            const double cl_tps = cl_wall    > 0.0 ? (double) cl_predict / cl_wall : 0.0;
+            const double cl_acc = cl_drafted > 0    ? 100.0 * (double) cl_accept / (double) cl_drafted : 0.0;
+            LOG("|%4s | %6d | %6d | %12lld | %9.3f | %12.2f | %7.2f%% |\n",
+                "CL", cl_pairs, cl_jobs, cl_predict, cl_wall, cl_tps, cl_acc);
+            LOG("\n");
+            LOG("%s: %d/%d prompts ok across cluster | %lld gen tokens | aggregate decode %.2f t/s (slowest-node wall %.3fs) | accept %.2f%%\n",
+                __func__, cl_ok, cl_jobs, cl_predict, cl_tps, cl_wall, cl_acc);
+            LOG("%s: real cluster speedup vs 1 GPU = compare this slowest-node wall to the '-dp 1 --dp-chunk-chars %d' single-GPU baseline wall (ideal = %dx)\n",
+                __func__, chunk, n_nodes * n_rep);
+        }
+        return ok_jobs == (size_t) M ? 0 : 1;
+    }
+#endif
+
+    // ---- node-local (single-node) report: unchanged from the pre-cluster path ----
     const double agg_tps = wall > 0.0 ? (double) tot_predict / wall : 0.0;
     const double accept  = tot_drafted > 0 ? 100.0 * (double) tot_accept / (double) tot_drafted : 0.0;
     const double balance = wall > 0.0 ? sum_job_time / wall : 0.0;  // ~n_rep when well balanced
@@ -166,7 +273,7 @@ static int run_dp_strong(const common_params & params, orchestrator_pool & pool,
 // Data-parallel speculative decoding entry: builds N (target+draft) replica pairs (one pair per GPU),
 // then runs STRONG scaling (default, distinct corpus shards) or WEAK scaling (--dp-weak diagnostic,
 // identical streams). The stock single-stream path (no -dp, no --dp-chunk-chars) never reaches here.
-static int speculative_dp(common_params & params) {
+static int speculative_dp(common_params & params, cluster_link * link) {
     llama_backend_init();
     llama_numa_init(params.numa);
 
@@ -219,7 +326,7 @@ static int speculative_dp(common_params & params) {
     // STRONG scaling (default): shard the corpus into distinct prompts across replicas - the real-work
     // throughput metric. WEAK scaling (--dp-weak) below is the identical-stream diagnostic.
     if (!params.dp_weak) {
-        const int rc = run_dp_strong(params, *pool, drafts, model_tgt, n_rep);
+        const int rc = run_dp_strong(params, *pool, drafts, model_tgt, n_rep, link);
         drafts.clear();
         pool.reset();
         llama_backend_free();
@@ -228,8 +335,21 @@ static int speculative_dp(common_params & params) {
 
     // --- WEAK scaling (--dp-weak): every replica runs the SAME prompt. the barrier deals exactly one
     // job to each replica (1:1 pairing) and aligns the timed start. NOT a real-work throughput number.
+#ifdef LLAMA_ORCH_MPI
+    const bool cluster_mode = link && link->size() > 1;
+    const int  n_nodes      = cluster_mode ? link->size() : 1;
+#else
+    const bool cluster_mode = false;
+    (void) link;
+#endif
+
     std::vector<spec_stream_stats> rep_stats(n_rep);
     auto                           barrier   = std::make_shared<spec_barrier>(n_rep);
+#ifdef LLAMA_ORCH_MPI
+    if (cluster_mode) {
+        link->barrier();   // align the timed start across nodes before any replica runs
+    }
+#endif
     for (int r = 0; r < n_rep; ++r) {
         pool->submit([&rep_stats, &drafts, model_tgt, &params, barrier](llama_context * ctx_tgt, int rr) -> bool {
             barrier->arrive_and_wait();
@@ -241,11 +361,15 @@ static int speculative_dp(common_params & params) {
     }
     const orchestrator_run_stats run = pool->drain();
 
-    // per-replica decode tok/s + acceptance, then an ALL row carrying the weak-scaling totals.
-    LOG("\n");
-    LOG("%s: weak-scaling DP speculative decoding: %d replicas, same prompt each\n", __func__, n_rep);
-    LOG("|%4s | %9s | %9s | %9s | %8s | %12s |\n", "REP", "n_predict", "n_drafted", "n_accept", "accept%", "decode t/s");
-    LOG("|%4s-|-%9s-|-%9s-|-%9s-|-%8s-|-%12s-|\n", "----", "---------", "---------", "---------", "--------", "------------");
+    // per-replica decode tok/s + acceptance, then an ALL row carrying the weak-scaling totals. In
+    // cluster mode the per-replica table is suppressed (it would interleave across ranks in the shared
+    // log); rank 0 prints a per-NODE + CL table after the gather below.
+    if (!cluster_mode) {
+        LOG("\n");
+        LOG("%s: weak-scaling DP speculative decoding: %d replicas, same prompt each\n", __func__, n_rep);
+        LOG("|%4s | %9s | %9s | %9s | %8s | %12s |\n", "REP", "n_predict", "n_drafted", "n_accept", "accept%", "decode t/s");
+        LOG("|%4s-|-%9s-|-%9s-|-%9s-|-%8s-|-%12s-|\n", "----", "---------", "---------", "---------", "--------", "------------");
+    }
 
     int    tot_predict = 0, tot_drafted = 0, tot_accept = 0;
     double max_t_dec   = 0.0;
@@ -254,10 +378,12 @@ static int speculative_dp(common_params & params) {
         const spec_stream_stats & s = rep_stats[r];
         const double dec_tps = s.t_dec_s   > 0.0 ? s.n_predict / s.t_dec_s     : 0.0;
         const double acc_pct = s.n_drafted > 0   ? 100.0 * s.n_accept / s.n_drafted : 0.0;
-        char rep_label[8];
-        snprintf(rep_label, sizeof(rep_label), "%d", r);
-        LOG("|%4s | %9d | %9d | %9d | %7.2f%% | %12.2f |\n",
-            rep_label, s.n_predict, s.n_drafted, s.n_accept, acc_pct, dec_tps);
+        if (!cluster_mode) {
+            char rep_label[8];
+            snprintf(rep_label, sizeof(rep_label), "%d", r);
+            LOG("|%4s | %9d | %9d | %9d | %7.2f%% | %12.2f |\n",
+                rep_label, s.n_predict, s.n_drafted, s.n_accept, acc_pct, dec_tps);
+        }
         if (s.ok) {
             ok_reps++;
             tot_predict += s.n_predict;
@@ -266,16 +392,72 @@ static int speculative_dp(common_params & params) {
             max_t_dec    = std::max(max_t_dec, s.t_dec_s);
         }
     }
-    // aggregate decode throughput: total predicted tokens over the concurrent span. max_t_dec = slowest
-    // replica's own decode time; run.seconds = pool drain() span (first dispatch -> last completion).
-    const double agg_tps_max = max_t_dec   > 0.0 ? tot_predict / max_t_dec  : 0.0;
-    const double agg_tps_e2e = run.seconds > 0.0 ? tot_predict / run.seconds : 0.0;
-    const double agg_acc_pct = tot_drafted > 0   ? 100.0 * tot_accept / tot_drafted : 0.0;
-    LOG("|%4s | %9d | %9d | %9d | %7.2f%% | %12.2f |\n",
-        "ALL", tot_predict, tot_drafted, tot_accept, agg_acc_pct, agg_tps_max);
-    LOG("\n");
-    LOG("%s: %zu/%d replicas ok; aggregate decode %.2f t/s (max-span) / %.2f t/s (e2e drain %.3fs)\n",
-        __func__, ok_reps, n_rep, agg_tps_max, agg_tps_e2e, run.seconds);
+
+#ifdef LLAMA_ORCH_MPI
+    if (cluster_mode) {
+        // aggregate decode throughput: total predicted tokens over the concurrent span. each node
+        // contributes its weak aggregate; rank 0 prints the per-NODE + CL table.
+        const std::string blob = string_format("%d %d %d %d %.9g %.9g\n",
+            n_rep, tot_predict, tot_drafted, tot_accept, max_t_dec, run.seconds);
+        const std::vector<std::string> gathered = link->gather(blob);
+
+        if (link->is_head()) {
+            LOG("\n");
+            LOG("%s: CLUSTER weak-scaling DP speculative decoding: %d nodes x %d replicas, same prompt each (diagnostic)\n",
+                __func__, n_nodes, n_rep);
+            LOG("|%4s | %9s | %9s | %9s | %8s | %12s |\n", "NODE", "n_predict", "n_drafted", "n_accept", "accept%", "decode t/s");
+            LOG("|%4s-|-%9s-|-%9s-|-%9s-|-%8s-|-%12s-|\n", "----", "---------", "---------", "---------", "--------", "------------");
+
+            long long cl_predict = 0, cl_drafted = 0, cl_accept = 0;
+            double    cl_max_dec = 0.0, cl_e2e = 0.0;
+            int       cl_pairs = 0;
+            bool      parse_ok = true;
+            for (int nd = 0; nd < (int) gathered.size(); ++nd) {
+                int    nrep = 0, pred = 0, draf = 0, acc = 0;
+                double mdec = 0.0, e2e = 0.0;
+                if (std::sscanf(gathered[nd].c_str(), "%d %d %d %d %lf %lf",
+                                &nrep, &pred, &draf, &acc, &mdec, &e2e) != 6) {
+                    parse_ok = false;
+                    break;
+                }
+                const double node_tps = mdec > 0.0 ? (double) pred / mdec : 0.0;
+                const double node_acc = draf > 0   ? 100.0 * (double) acc / (double) draf : 0.0;
+                LOG("|%4d | %9d | %9d | %9d | %7.2f%% | %12.2f |\n",
+                    nd, pred, draf, acc, node_acc, node_tps);
+                cl_predict += pred;
+                cl_drafted += draf;
+                cl_accept  += acc;
+                cl_max_dec  = std::max(cl_max_dec, mdec);
+                cl_e2e      = std::max(cl_e2e, e2e);
+                cl_pairs   += nrep;
+            }
+            if (!parse_ok) {
+                LOG_ERR("%s: cluster reduce failed: a node aggregate blob did not parse\n", __func__);
+            } else {
+                const double cl_tps_max = cl_max_dec > 0.0 ? (double) cl_predict / cl_max_dec : 0.0;
+                const double cl_tps_e2e = cl_e2e     > 0.0 ? (double) cl_predict / cl_e2e     : 0.0;
+                const double cl_acc     = cl_drafted > 0   ? 100.0 * (double) cl_accept / (double) cl_drafted : 0.0;
+                LOG("|%4s | %9lld | %9lld | %9lld | %7.2f%% | %12.2f |\n",
+                    "CL", cl_predict, cl_drafted, cl_accept, cl_acc, cl_tps_max);
+                LOG("\n");
+                LOG("%s: %d (target+draft) pairs; cluster aggregate decode %.2f t/s (max-span) / %.2f t/s (e2e drain) | accept %.2f%%\n",
+                    __func__, cl_pairs, cl_tps_max, cl_tps_e2e, cl_acc);
+            }
+        }
+    } else
+#endif
+    {
+        // aggregate decode throughput: total predicted tokens over the concurrent span. max_t_dec =
+        // slowest replica's own decode time; run.seconds = pool drain() span (dispatch -> completion).
+        const double agg_tps_max = max_t_dec   > 0.0 ? tot_predict / max_t_dec  : 0.0;
+        const double agg_tps_e2e = run.seconds > 0.0 ? tot_predict / run.seconds : 0.0;
+        const double agg_acc_pct = tot_drafted > 0   ? 100.0 * tot_accept / tot_drafted : 0.0;
+        LOG("|%4s | %9d | %9d | %9d | %7.2f%% | %12.2f |\n",
+            "ALL", tot_predict, tot_drafted, tot_accept, agg_acc_pct, agg_tps_max);
+        LOG("\n");
+        LOG("%s: %zu/%d replicas ok; aggregate decode %.2f t/s (max-span) / %.2f t/s (e2e drain %.3fs)\n",
+            __func__, ok_reps, n_rep, agg_tps_max, agg_tps_e2e, run.seconds);
+    }
 
     // teardown order: draft contexts first, then the pool (joins workers, frees target contexts).
     drafts.clear();
@@ -286,6 +468,14 @@ static int speculative_dp(common_params & params) {
 
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
+
+    // initialize the cross-node link first (MPI_Init may consume its own argv entries). A non-MPI
+    // build or a single-rank launch leaves `link` benign (size()==1) -> no behaviour change.
+    cluster_link * link = nullptr;
+#ifdef LLAMA_ORCH_MPI
+    std::unique_ptr<cluster_link> cluster = cluster_link::init(&argc, &argv);
+    link = cluster.get();
+#endif
 
     common_params params;
 
@@ -312,8 +502,17 @@ int main(int argc, char ** argv) {
     // the orchestrator is active (-dp > 1) OR a strong-scaling shard size is given (--dp-chunk-chars > 0,
     // which also enables the n_rep==1 serial baseline). plain single-stream (no -dp, no chunk) falls
     // through to the unchanged path below.
+#ifdef LLAMA_ORCH_MPI
+    // cross-node aggregation lives in the data-parallel path; warn if launched multi-rank without a DP
+    // flag (each rank would otherwise run an independent single-stream spec decode and print its own).
+    if (link && link->size() > 1 && !(orchestrator_dp_active(params) || params.dp_chunk_chars > 0) && link->is_head()) {
+        LOG_WRN("%s: launched on %d ranks but no DP path is active; cluster aggregation needs -dp or "
+                "--dp-chunk-chars. Each rank will run independently.\n", __func__, link->size());
+    }
+#endif
+
     if (orchestrator_dp_active(params) || params.dp_chunk_chars > 0) {
-        return speculative_dp(params);
+        return speculative_dp(params, link);
     }
 
     // init llama.cpp
