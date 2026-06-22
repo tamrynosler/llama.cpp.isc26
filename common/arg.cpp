@@ -2529,6 +2529,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_DP_CHUNK_CHARS"));
     add_opt(common_arg(
+        {"--dp-steal"},
+        "data-parallel speculative decoding (STRONG scaling, MULTI-NODE only): pull corpus shards from a\n"
+        "shared cross-node work queue instead of a static per-node stripe, so a node that finishes early\n"
+        "steals the slow node's remaining work (better cross-node load balance). single-node runs are\n"
+        "unaffected (the local pool already work-steals). default off. consumed by llama-speculative.",
+        [](common_params & params) {
+            params.dp_steal = true;
+        }
+    ).set_env("LLAMA_ARG_DP_STEAL"));
+    add_opt(common_arg(
         { "-fit", "--fit" }, "[on|off]",
         string_format("whether to adjust unset arguments to fit in device memory ('on' or 'off', default: '%s')", params.fit_params ? "on" : "off"),
         [](common_params & params, const std::string & value) {

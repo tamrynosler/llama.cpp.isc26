@@ -1,6 +1,7 @@
 // tools/orchestrator/cluster.h
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -43,6 +44,17 @@ struct cluster_link {
     // rank 0's blob copied to every rank; returns the head's blob on all ranks.
     // Declared now so the contract is stable; first consumer is Phase 2.
     std::string broadcast(const std::string & blob);
+
+    // ---- distributed work counter (cross-node dynamic load balancing) ----
+    // A single monotonic counter hosted on rank 0, for pulling global work indices on demand.
+    // counter_begin()/counter_end() are COLLECTIVE (all ranks, paired). claim(n) atomically reserves
+    // the next `n` indices and returns the first reserved index (the value BEFORE the increment); the
+    // caller stops once the returned index is >= its known total. Like the collectives above, these
+    // are called from the MAIN thread only (FUNNELED). Coarse-grained - one call per work item/batch,
+    // never per token/step - so the node-local property that preserves the measured scaling holds.
+    void    counter_begin();
+    int64_t claim(int n);
+    void    counter_end();
 
 private:
     cluster_link();

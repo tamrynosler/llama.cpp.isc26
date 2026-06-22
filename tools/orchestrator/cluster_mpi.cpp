@@ -21,6 +21,11 @@ struct cluster_link::impl {
     int  rank        = 0;
     int  size        = 1;
     bool we_init_mpi = false; // true if WE called MPI_Init (so WE finalize)
+
+    // distributed work counter (counter_begin/claim/counter_end). the int64 lives on rank 0; every
+    // rank reaches it via passive-target RMA (one shared lock epoch open for the counter's lifetime).
+    MPI_Win counter_win = MPI_WIN_NULL;
+    int64_t counter     = 0;
 };
 
 // ---- lifecycle -------------------------------------------------------------
@@ -133,4 +138,33 @@ std::string cluster_link::broadcast(const std::string & blob) {
         MPI_Bcast(out.data(), len, MPI_CHAR, 0, MPI_COMM_WORLD);
     }
     return out;
+}
+
+// ---- distributed work counter ---------------------------------------------
+
+void cluster_link::counter_begin() {
+    // rank 0 backs the counter (size 8); other ranks expose a zero-size window but still target rank 0.
+    p->counter = 0;
+    const MPI_Aint bytes = is_head() ? (MPI_Aint) sizeof(int64_t) : 0;
+    MPI_Win_create(&p->counter, bytes, sizeof(int64_t),
+                   MPI_INFO_NULL, MPI_COMM_WORLD, &p->counter_win);
+    // one passive-target epoch open for the whole run; claim() uses MPI_Win_flush to complete each op.
+    MPI_Win_lock_all(0, p->counter_win);
+}
+
+int64_t cluster_link::claim(int n) {
+    int64_t increment = n;
+    int64_t result    = 0;
+    // atomic fetch-and-add on rank 0's counter; result is the pre-increment value (first reserved index).
+    MPI_Fetch_and_op(&increment, &result, MPI_INT64_T, 0, /*disp=*/0, MPI_SUM, p->counter_win);
+    MPI_Win_flush(0, p->counter_win); // ensure the RMA completed before we read `result`
+    return result;
+}
+
+void cluster_link::counter_end() {
+    if (p->counter_win != MPI_WIN_NULL) {
+        MPI_Win_unlock_all(p->counter_win);
+        MPI_Win_free(&p->counter_win);
+        p->counter_win = MPI_WIN_NULL;
+    }
 }

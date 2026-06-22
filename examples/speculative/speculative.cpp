@@ -130,47 +130,105 @@ static int run_dp_strong(const common_params & params, orchestrator_pool & pool,
     (void) link;
 #endif
 
-    std::vector<int> local_idx;                       // global chunk indices assigned to THIS node
-    for (int i = 0; i < M_total; ++i) {
-        if (i % n_nodes == rank) {
-            local_idx.push_back(i);
-        }
-    }
-    const int M = (int) local_idx.size();             // jobs on this node
-    if (cluster_mode) {
-        LOG_INF("%s: strong scaling (cluster): node %d/%d runs %d of %d distinct prompts across %d replicas\n",
-                __func__, rank, n_nodes, M, M_total, n_rep);
-    } else {
-        LOG_INF("%s: strong scaling: %d distinct prompts (%d-byte shards) across %d replicas\n",
-                __func__, M_total, chunk, n_rep);
-    }
-
-    std::vector<spec_stream_stats> job_stats(M);          // distinct index per job -> race-free
+    // both the static-stripe and work-stealing paths fill these; downstream aggregation/gather is
+    // identical. job_stats is sized to the upper bound (a node can't run more than every chunk) and
+    // indexed by local submission order; M is how many this node actually ran.
+    std::vector<spec_stream_stats> job_stats(M_total);    // distinct slot per job -> race-free
     std::vector<int>               rep_jobs(n_rep, 0);    // each index written only by its own worker
     std::vector<long long>         rep_tokens(n_rep, 0);
+    int                            M = 0;                 // jobs executed on this node
+    orchestrator_run_stats         run;
 
 #ifdef LLAMA_ORCH_MPI
-    // align the timed-region start across nodes: no node begins submitting until all have finished
-    // loading + warming up (mirrors batched-bench's pre-sweep link->barrier()).
-    if (cluster_mode) {
-        link->barrier();
-    }
+    const bool use_steal = cluster_mode && params.dp_steal;
+#else
+    const bool use_steal = false;
 #endif
 
-    for (int j = 0; j < M; ++j) {
-        const int i = local_idx[j];                   // global chunk index for this local job
-        pool.submit([&job_stats, &drafts, &rep_jobs, &rep_tokens, model_tgt, &params, &chunks, i, j]
-                    (llama_context * ctx_tgt, int rr) -> bool {
-            common_params jp = params;        // per-job copy (concurrent read-only copy of params is safe)
-            jp.prompt = chunks[i];
-            job_stats[j] = run_spec_stream(ctx_tgt, drafts[rr]->context(),
-                                           model_tgt, drafts[rr]->model(), jp, /*print=*/false);
-            rep_jobs[rr]   += 1;
-            rep_tokens[rr] += job_stats[j].n_predict;
-            return job_stats[j].ok;
-        });
+    if (use_steal) {
+#ifdef LLAMA_ORCH_MPI
+        // CROSS-NODE WORK-STEALING: pull global chunk indices from a shared counter on demand instead
+        // of a static stripe, so a node that finishes early takes the slow node's remaining prompts.
+        // A small permit pool bounds this node's outstanding (queued + in-flight) work to ~n_rep+2
+        // chunks: the pool's queue_cap is large, so submit() does NOT self-throttle - without this one
+        // node would claim the whole corpus into its local queue and we'd be back to a static (worse)
+        // split. claim() is one coarse RMA per chunk (not per token).
+        LOG_INF("%s: strong scaling (cluster, work-stealing): node %d/%d pulls from a shared queue of "
+                "%d distinct prompts across %d replicas\n", __func__, rank, n_nodes, M_total, n_rep);
+
+        link->counter_begin();
+        link->barrier();                                  // align the timed-region start across nodes
+
+        std::mutex              pmtx;
+        std::condition_variable pcv;
+        int                     permits = n_rep + 2;      // small per-node look-ahead window
+
+        while (true) {
+            { std::unique_lock<std::mutex> lk(pmtx); pcv.wait(lk, [&] { return permits > 0; }); --permits; }
+            const long long g = link->claim(1);           // atomic global chunk index
+            if (g >= (long long) M_total) {
+                { std::lock_guard<std::mutex> lk(pmtx); ++permits; }   // unused; hand it back
+                break;
+            }
+            const int slot = M++;                          // local submission order (main thread only)
+            const int gi   = (int) g;
+            pool.submit([&job_stats, &drafts, &rep_jobs, &rep_tokens, model_tgt, &params, &chunks,
+                         &pmtx, &pcv, &permits, slot, gi](llama_context * ctx_tgt, int rr) -> bool {
+                common_params jp = params;        // per-job copy (concurrent read-only copy of params is safe)
+                jp.prompt = chunks[gi];
+                job_stats[slot] = run_spec_stream(ctx_tgt, drafts[rr]->context(),
+                                                  model_tgt, drafts[rr]->model(), jp, /*print=*/false);
+                rep_jobs[rr]   += 1;
+                rep_tokens[rr] += job_stats[slot].n_predict;
+                { std::lock_guard<std::mutex> lk(pmtx); ++permits; }   // release a permit on completion
+                pcv.notify_one();
+                return job_stats[slot].ok;
+            });
+        }
+        run = pool.drain();
+        link->counter_end();
+#endif
+    } else {
+        // STATIC stripe: each node runs chunk i where i % n_nodes == rank (no cross-node stealing;
+        // intra-node stealing still balances the local replicas). single-rank/non-MPI -> all chunks.
+        std::vector<int> local_idx;                       // global chunk indices assigned to THIS node
+        for (int i = 0; i < M_total; ++i) {
+            if (i % n_nodes == rank) {
+                local_idx.push_back(i);
+            }
+        }
+        M = (int) local_idx.size();
+        if (cluster_mode) {
+            LOG_INF("%s: strong scaling (cluster): node %d/%d runs %d of %d distinct prompts across %d replicas\n",
+                    __func__, rank, n_nodes, M, M_total, n_rep);
+        } else {
+            LOG_INF("%s: strong scaling: %d distinct prompts (%d-byte shards) across %d replicas\n",
+                    __func__, M_total, chunk, n_rep);
+        }
+
+#ifdef LLAMA_ORCH_MPI
+        // align the timed-region start across nodes: no node begins submitting until all have finished
+        // loading + warming up (mirrors batched-bench's pre-sweep link->barrier()).
+        if (cluster_mode) {
+            link->barrier();
+        }
+#endif
+
+        for (int j = 0; j < M; ++j) {
+            const int i = local_idx[j];                   // global chunk index for this local job
+            pool.submit([&job_stats, &drafts, &rep_jobs, &rep_tokens, model_tgt, &params, &chunks, i, j]
+                        (llama_context * ctx_tgt, int rr) -> bool {
+                common_params jp = params;        // per-job copy (concurrent read-only copy of params is safe)
+                jp.prompt = chunks[i];
+                job_stats[j] = run_spec_stream(ctx_tgt, drafts[rr]->context(),
+                                               model_tgt, drafts[rr]->model(), jp, /*print=*/false);
+                rep_jobs[rr]   += 1;
+                rep_tokens[rr] += job_stats[j].n_predict;
+                return job_stats[j].ok;
+            });
+        }
+        run = pool.drain();
     }
-    const orchestrator_run_stats run = pool.drain();
 
     long long tot_predict = 0, tot_drafted = 0, tot_accept = 0;
     double    sum_job_time = 0.0;             // serial-equivalent work (enc+dec), measured under load

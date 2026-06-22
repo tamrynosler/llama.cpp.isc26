@@ -483,6 +483,9 @@ struct common_params {
                                    // default is strong scaling (distinct corpus shards per replica)
     int32_t dp_chunk_chars = 0;    // strong scaling: bytes per corpus shard; >0 also engages the batch
                                    // path at any replica count (so -dp 1 gives the serial baseline)
+    bool    dp_steal      = false; // strong scaling, MULTI-NODE only: pull corpus shards from a shared
+                                   // cross-node work queue instead of a static per-node stripe, so a
+                                   // node that finishes early steals the slow node's remaining work
 
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;

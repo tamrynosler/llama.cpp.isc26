@@ -5,6 +5,7 @@
 #include "cluster.h"
 
 #include <cstdio>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -55,9 +56,52 @@ int main(int argc, char ** argv) {
     const std::string bcast = link->broadcast(link->is_head() ? "hello-from-head" : "");
     CHECK(bcast == "hello-from-head", "broadcast did not deliver the head's blob");
 
+    // distributed work counter: every rank claims indices until the shared counter is exhausted. the
+    // union of all claimed indices must be exactly {0..TOTAL-1}, each exactly once (no dup, no gap) -
+    // this is the cross-node work-stealing invariant.
+    {
+        const int TOTAL = 1000;
+        link->counter_begin();
+        link->barrier();
+
+        std::vector<int> mine_idx;
+        for (;;) {
+            const long long g = link->claim(1);
+            if (g >= TOTAL) {
+                break;
+            }
+            mine_idx.push_back((int) g);
+        }
+        link->counter_end();
+
+        std::string blob;
+        for (int v : mine_idx) {
+            blob += std::to_string(v) + " ";
+        }
+        std::vector<std::string> claimed = link->gather(blob);
+
+        if (link->is_head()) {
+            std::vector<int> seen(TOTAL, 0);
+            int total_claimed = 0;
+            for (const std::string & b : claimed) {
+                std::stringstream ss(b);
+                int v;
+                while (ss >> v) {
+                    CHECK(v >= 0 && v < TOTAL, "counter: claimed index out of range");
+                    seen[v]++;
+                    total_claimed++;
+                }
+            }
+            CHECK(total_claimed == TOTAL, "counter: total claimed != TOTAL (gap or overrun)");
+            for (int i = 0; i < TOTAL; ++i) {
+                CHECK(seen[i] == 1, "counter: an index was not claimed exactly once");
+            }
+        }
+    }
+
     link->barrier();
     if (link->is_head()) {
-        printf("[cluster-test] PASS (%d ranks: init/barrier/gather/broadcast)\n", size);
+        printf("[cluster-test] PASS (%d ranks: init/barrier/gather/broadcast/counter)\n", size);
     }
     return 0;
 }
