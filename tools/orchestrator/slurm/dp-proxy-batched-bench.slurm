@@ -36,8 +36,8 @@ export CUDA_VISIBLE_DEVICES=0,1,2,3
 NGL=99
 PP=512
 TG=128
-PL="1,2,4,8"        # pl=1 cannot shard (1 GPU busy); pl>=4 exercises all four replicas
-CTX=8192            # >= pl*(pp+tg) for the largest pl (8*640=5120)
+PL="1,2,4,8,16,32"  # pl=1 cannot shard; higher pl => more seqs/GPU => closer to 4x
+CTX=32768           # >= pl*(pp+tg) for the largest pl (32*640=20480)
 NBATCH=2048
 UBATCH=512
 

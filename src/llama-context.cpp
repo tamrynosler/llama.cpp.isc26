@@ -3507,6 +3507,9 @@ uint32_t llama_n_ubatch(const llama_context * ctx) {
 }
 
 uint32_t llama_n_seq_max(const llama_context * ctx) {
+    if (llama_dp_is_ctx(ctx)) {
+        return llama_dp_n_seq_max(ctx);
+    }
     return ctx->n_seq_max();
 }
 
@@ -3515,6 +3518,9 @@ uint32_t llama_n_rs_seq(const llama_context * ctx) {
 }
 
 const llama_model * llama_get_model(const llama_context * ctx) {
+    if (llama_dp_is_ctx(ctx)) {
+        return llama_dp_get_model(ctx);
+    }
     return &ctx->get_model();
 }
 
@@ -3570,12 +3576,18 @@ void llama_synchronize(llama_context * ctx) {
 }
 
 float * llama_get_logits(llama_context * ctx) {
+    if (llama_dp_is_ctx(ctx)) {
+        return llama_dp_get_logits(ctx);
+    }
     ctx->synchronize();
 
     return ctx->get_logits();
 }
 
 float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
+    if (llama_dp_is_ctx(ctx)) {
+        return llama_dp_get_logits_ith(ctx, i);
+    }
     ctx->synchronize();
 
     float * res = nullptr;

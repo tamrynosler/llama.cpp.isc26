@@ -49,9 +49,17 @@ bool           llama_dp_is_ctx     (const struct llama_context * ctx);
 int32_t        llama_dp_decode      (struct llama_context * ctx, struct llama_batch batch);
 void           llama_dp_synchronize (struct llama_context * ctx);
 uint32_t       llama_dp_n_ctx       (const struct llama_context * ctx);
+uint32_t       llama_dp_n_seq_max   (const struct llama_context * ctx);
 llama_memory_t llama_dp_get_memory  (struct llama_context * ctx);
+const struct llama_model * llama_dp_get_model(const struct llama_context * ctx);
 void           llama_dp_perf_print  (const struct llama_context * ctx);
 void           llama_dp_free        (struct llama_context * ctx);
+
+// logits readback (perplexity). a token decoded on replica r is read back from r; because each
+// sequence lives wholly on one replica and stays contiguous, the per-sequence contiguous read in
+// perplexity's process_logits() is preserved.
+float *        llama_dp_get_logits    (struct llama_context * ctx);
+float *        llama_dp_get_logits_ith(struct llama_context * ctx, int32_t i);
 
 //
 // memory side (the memory handle returned by llama_dp_get_memory is the proxy context itself)

@@ -28,10 +28,18 @@ struct llama_dp_model {
 struct llama_dp_context {
     int                          n = 0;
     int32_t                      n_kv_max = 0;
+    int32_t                      n_vocab  = 0;
+    llama_model *                model_handle = nullptr; // proxy model handle (for llama_get_model)
     std::vector<llama_context *> ctxs;     // owned
     std::vector<llama_memory_t>  mems;     // ctxs[r]'s memory (cached, not owned)
     std::vector<llama_batch>     scratch;  // per-replica decode scratch (owned)
     std::vector<int8_t>          ret;      // per-replica decode return code
+
+    // per-decode output routing (for llama_get_logits[_ith]). index by the global batch position.
+    std::vector<int>             route_r;   // global token i -> replica that decoded it
+    std::vector<int>             route_li;  // global token i -> its local batch index on that replica
+    std::vector<int8_t>          route_out; // global token i had logits requested
+    std::vector<float>           logits_buf; // scratch for the concatenated llama_get_logits()
 
     // --- worker pool ---
     std::vector<std::thread>     workers;
@@ -183,6 +191,8 @@ llama_context * llama_dp_init(llama_model * dp_model_handle, llama_context_param
 
     auto * dp = new llama_dp_context();
     dp->n = n;
+    dp->model_handle = dp_model_handle;
+    dp->n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(dpm->replicas[0]));
     dp->ctxs.reserve(n);
     dp->mems.reserve(n);
 
@@ -227,9 +237,13 @@ int32_t llama_dp_decode(llama_context * ctx, llama_batch batch) {
     const int n = dp->n;
 
     // shard the batch by sequence id: sequence j -> replica (j % n), local seq id (j / n).
+    // record where each global token landed so llama_get_logits[_ith] can read it back.
     for (int r = 0; r < n; ++r) {
         dp->scratch[r].n_tokens = 0;
     }
+    dp->route_r.assign(batch.n_tokens, 0);
+    dp->route_li.assign(batch.n_tokens, 0);
+    dp->route_out.assign(batch.n_tokens, 0);
     for (int i = 0; i < batch.n_tokens; ++i) {
         const llama_seq_id seq = (batch.seq_id && batch.n_seq_id && batch.n_seq_id[i] > 0)
                                      ? batch.seq_id[i][0] : 0;
@@ -244,6 +258,10 @@ int32_t llama_dp_decode(llama_context * ctx, llama_batch batch) {
         s.seq_id  [k][0] = loc;
         s.logits  [k]    = batch.logits ? batch.logits[i] : 0;
         s.n_tokens++;
+
+        dp->route_r  [i] = r;
+        dp->route_li [i] = k;
+        dp->route_out[i] = batch.logits ? batch.logits[i] : 0;
     }
 
     std::fill(dp->ret.begin(), dp->ret.end(), (int8_t) 0);
@@ -275,6 +293,43 @@ uint32_t llama_dp_n_ctx(const llama_context * ctx) {
 llama_memory_t llama_dp_get_memory(llama_context * ctx) {
     // the proxy context itself is the memory handle; the memory wrappers route via the registry.
     return reinterpret_cast<llama_memory_t>(ctx);
+}
+
+uint32_t llama_dp_n_seq_max(const llama_context * ctx) {
+    const auto * dp = reinterpret_cast<const llama_dp_context *>(ctx);
+    return llama_n_seq_max(dp->ctxs[0]); // identical across replicas
+}
+
+const llama_model * llama_dp_get_model(const llama_context * ctx) {
+    const auto * dp = reinterpret_cast<const llama_dp_context *>(ctx);
+    return dp->model_handle; // the proxy model (its vocab routes to replica 0)
+}
+
+float * llama_dp_get_logits_ith(llama_context * ctx, int32_t i) {
+    auto * dp = reinterpret_cast<llama_dp_context *>(ctx);
+    if (i < 0 || i >= (int) dp->route_r.size()) {
+        return nullptr;
+    }
+    // the whole sequence that owns token i lives on this replica and is contiguous there, so the
+    // caller's contiguous read of the following rows stays valid.
+    return llama_get_logits_ith(dp->ctxs[dp->route_r[i]], dp->route_li[i]);
+}
+
+float * llama_dp_get_logits(llama_context * ctx) {
+    auto * dp = reinterpret_cast<llama_dp_context *>(ctx);
+    // rebuild the requested-output rows in global batch order (what llama_get_logits returns).
+    // only reached when n_ctx > n_batch, which forces n_seq == 1 (all tokens on replica 0).
+    dp->logits_buf.clear();
+    for (size_t i = 0; i < dp->route_r.size(); ++i) {
+        if (!dp->route_out[i]) {
+            continue;
+        }
+        const float * row = llama_get_logits_ith(dp->ctxs[dp->route_r[i]], dp->route_li[i]);
+        if (row) {
+            dp->logits_buf.insert(dp->logits_buf.end(), row, row + dp->n_vocab);
+        }
+    }
+    return dp->logits_buf.data();
 }
 
 void llama_dp_perf_print(const llama_context * ctx) {
