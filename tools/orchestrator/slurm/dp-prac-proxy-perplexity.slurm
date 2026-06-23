@@ -21,7 +21,9 @@
 # Build first (A100 = sm_80), from the repo root, on feat/orchestrator2:
 #   ml gcc; ml cuda
 #   cmake -B build-a100 -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=80 -DCMAKE_BUILD_TYPE=Release
-#   cmake --build build-a100 -j$(nproc)
+#   cmake --build build-a100 --target llama-batched-bench llama-perplexity -j$(nproc)
+#   (target only the two binaries we use; building everything pulls in tools/ui, which fails to
+#    compile on nodes without npm/internet for the UI asset download)
 
 set -euo pipefail
 
