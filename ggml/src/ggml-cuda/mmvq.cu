@@ -5,6 +5,13 @@
 
 #include <cstdint>
 
+// Hopper (sm_90) batch-1 MMVQ warp count for the K-quants (Q4_K/Q5_K/Q6_K), which
+// dominate decode. 4 == the generic value Hopper currently inherits; overridable at
+// build time for tuning sweeps:  -DGGML_MMVQ_HOPPER_KQUANT_NWARPS=<2|4|8>
+#ifndef GGML_MMVQ_HOPPER_KQUANT_NWARPS
+#define GGML_MMVQ_HOPPER_KQUANT_NWARPS 4
+#endif
+
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
 
 static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) {
@@ -67,7 +74,8 @@ enum mmvq_parameter_table_id {
     MMVQ_PARAMETERS_GCN,
     MMVQ_PARAMETERS_RDNA2,
     MMVQ_PARAMETERS_RDNA3_0,
-    MMVQ_PARAMETERS_RDNA4
+    MMVQ_PARAMETERS_RDNA4,
+    MMVQ_PARAMETERS_HOPPER
 };
 
 static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
@@ -81,6 +89,8 @@ static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
     return MMVQ_PARAMETERS_GCN;
 #elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_TURING && __CUDA_ARCH__ < GGML_CUDA_CC_AMPERE
     return MMVQ_PARAMETERS_TURING;
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER && __CUDA_ARCH__ < GGML_CUDA_CC_BLACKWELL
+    return MMVQ_PARAMETERS_HOPPER;
 #else
     return MMVQ_PARAMETERS_GENERIC;
 #endif
@@ -101,6 +111,9 @@ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
     }
     if (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_TURING && ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_AMPERE) {
         return MMVQ_PARAMETERS_TURING;
+    }
+    if (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_HOPPER && ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_BLACKWELL) {
+        return MMVQ_PARAMETERS_HOPPER;
     }
     return MMVQ_PARAMETERS_GENERIC;
 }
@@ -377,6 +390,34 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
                 return 1;
         }
     }
+    if (table_id == MMVQ_PARAMETERS_HOPPER) {
+        // Hopper (sm_90) inherits the generic batch-1 config; only the K-quant
+        // ncols_dst==1 warp count is exposed for tuning. Everything else mirrors GENERIC.
+        if (ncols_dst == 1) {
+            switch (type) {
+                case GGML_TYPE_Q4_K:
+                case GGML_TYPE_Q5_K:
+                case GGML_TYPE_Q6_K:
+                    return GGML_MMVQ_HOPPER_KQUANT_NWARPS;
+                default:
+                    break;
+            }
+        }
+        switch (ncols_dst) {
+            case 1:
+            case 2:
+            case 3:
+            case 4:
+                return 4;
+            case 5:
+            case 6:
+            case 7:
+            case 8:
+                return 2;
+            default:
+                return 1;
+        }
+    }
     if (table_id == MMVQ_PARAMETERS_RDNA4) {
         // nwarps=8 benefits types with simple vec_dot on RDNA4 (ncols_dst=1).
         // Types with complex vec_dot (Q3_K, IQ2_*, IQ3_*) regress due to register
@@ -453,7 +494,7 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
 }
 
 static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
-    if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING) {
+    if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_HOPPER) {
         switch (ncols_dst) {
             case 1:
                 return small_k ? nwarps : 1;
