@@ -2235,9 +2235,6 @@ llama_model_params llama_model_default_params() {
 }
 
 const llama_vocab * llama_model_get_vocab(const llama_model * model) {
-    if (llama_dp_is_model(model)) {
-        return llama_dp_model_vocab(model);
-    }
     return &model->vocab;
 }
 

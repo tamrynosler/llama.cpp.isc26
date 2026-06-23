@@ -1,7 +1,8 @@
 // src/llama-dp.cpp — see llama-dp.h for the design overview.
 
 #include "llama-dp.h"
-#include "llama-impl.h" // LLAMA_LOG_*
+#include "llama-impl.h"   // LLAMA_LOG_*
+#include "llama-memory.h" // call llama_memory_i methods directly when fanning memory ops
 
 #include <algorithm>
 #include <condition_variable>
@@ -9,17 +10,16 @@
 #include <functional>
 #include <mutex>
 #include <thread>
-#include <unordered_set>
+#include <unordered_map>
 #include <vector>
 
 // ---------------------------------------------------------------------------
-// proxy objects
+// side state attached to a lead (replica-0) handle
 // ---------------------------------------------------------------------------
 
-// N independent replica models, replica r pinned to device r.
 struct llama_dp_model {
-    int                          n = 0;
-    std::vector<llama_model *>   replicas;
+    int                        n = 0;
+    std::vector<llama_model *> replicas; // replicas[0] is the handle returned to the caller
 };
 
 // N replica contexts + a worker pool (one thread per replica). The hot path shards a batch's
@@ -29,17 +29,16 @@ struct llama_dp_context {
     int                          n = 0;
     int32_t                      n_kv_max = 0;
     int32_t                      n_vocab  = 0;
-    llama_model *                model_handle = nullptr; // proxy model handle (for llama_get_model)
-    std::vector<llama_context *> ctxs;     // owned
-    std::vector<llama_memory_t>  mems;     // ctxs[r]'s memory (cached, not owned)
+    std::vector<llama_context *> ctxs;     // ctxs[0] is the handle; owned
+    std::vector<llama_memory_t>  mems;     // ctxs[r]'s memory (mems[0] is the memory handle)
     std::vector<llama_batch>     scratch;  // per-replica decode scratch (owned)
     std::vector<int8_t>          ret;      // per-replica decode return code
 
-    // per-decode output routing (for llama_get_logits[_ith]). index by the global batch position.
-    std::vector<int>             route_r;   // global token i -> replica that decoded it
-    std::vector<int>             route_li;  // global token i -> its local batch index on that replica
-    std::vector<int8_t>          route_out; // global token i had logits requested
-    std::vector<float>           logits_buf; // scratch for the concatenated llama_get_logits()
+    // per-decode output routing (for llama_get_logits[_ith]); indexed by global batch position.
+    std::vector<int>             route_r;
+    std::vector<int>             route_li;
+    std::vector<int8_t>          route_out;
+    std::vector<float>           logits_buf;
 
     // --- worker pool ---
     std::vector<std::thread>     workers;
@@ -47,13 +46,11 @@ struct llama_dp_context {
     std::mutex                   mtx;
     std::condition_variable      cv_start;
     std::condition_variable      cv_done;
-    uint64_t                     gen   = 0;       // bumped once per dispatch
-    std::vector<uint64_t>        seen;            // last gen each worker ran
+    uint64_t                     gen   = 0;
+    std::vector<uint64_t>        seen;
     int                          ndone = 0;
     bool                         stop  = false;
-    bool                         warned_cross_replica = false;
 
-    // run fn(r) on every replica's worker thread, concurrently, and block until all finish.
     void run_on_all(const std::function<void(int)> & fn) {
         {
             std::unique_lock<std::mutex> lk(mtx);
@@ -78,8 +75,7 @@ struct llama_dp_context {
                 seen[r] = gen;
                 myjob   = job;
             }
-            // failure isolation: a throw on one replica must not take down the process or
-            // wedge the barrier; it is reported through the job's own side effects (e.g. ret[r]).
+            // failure isolation: a throw on one replica must not wedge the barrier.
             try {
                 myjob(r);
             } catch (const std::exception & e) {
@@ -99,35 +95,28 @@ struct llama_dp_context {
 };
 
 // ---------------------------------------------------------------------------
-// registries — identify proxy handles handed back to the (unmodified) tool
+// registries: lead (replica-0) handle -> side state
 // ---------------------------------------------------------------------------
 
 namespace {
-    std::mutex                    g_reg_mtx;
-    std::unordered_set<const void *> g_ctx_handles;   // llama_dp_context* (also used as the memory handle)
-    std::unordered_set<const void *> g_model_handles; // llama_dp_model*
+    std::mutex g_mtx;
+    std::unordered_map<const void *, llama_dp_model *>   g_models; // model0 -> dp_model
+    std::unordered_map<const void *, llama_dp_context *> g_ctxs;   // ctx0   -> dp_context
+    std::unordered_map<const void *, llama_dp_context *> g_mems;   // mem0   -> dp_context
 
-    void reg_add(std::unordered_set<const void *> & s, const void * p) {
-        std::lock_guard<std::mutex> lk(g_reg_mtx);
-        s.insert(p);
-    }
-    void reg_del(std::unordered_set<const void *> & s, const void * p) {
-        std::lock_guard<std::mutex> lk(g_reg_mtx);
-        s.erase(p);
-    }
-    bool reg_has(const std::unordered_set<const void *> & s, const void * p) {
-        std::lock_guard<std::mutex> lk(g_reg_mtx);
-        return s.find(p) != s.end();
+    template <class Map>
+    typename Map::mapped_type lookup(Map & m, const void * p) {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        auto it = m.find(p);
+        return it == m.end() ? nullptr : it->second;
     }
 }
 
-bool llama_dp_enabled(const llama_model_params & params) {
-    return params.n_data_parallel > 1;
-}
+bool llama_dp_enabled(const llama_model_params & params) { return params.n_data_parallel > 1; }
 
-bool llama_dp_is_model(const llama_model * model) { return reg_has(g_model_handles, model); }
-bool llama_dp_is_ctx  (const llama_context * ctx) { return reg_has(g_ctx_handles,   ctx);   }
-bool llama_dp_is_mem  (const llama_memory_t mem)  { return reg_has(g_ctx_handles,   mem);   }
+bool llama_dp_is_model(const llama_model * m) { std::lock_guard<std::mutex> lk(g_mtx); return g_models.count(m); }
+bool llama_dp_is_ctx  (const llama_context * c) { std::lock_guard<std::mutex> lk(g_mtx); return g_ctxs.count(c); }
+bool llama_dp_is_mem  (const llama_memory_t m)  { std::lock_guard<std::mutex> lk(g_mtx); return g_mems.count(m); }
 
 // ---------------------------------------------------------------------------
 // model side
@@ -162,19 +151,18 @@ llama_model * llama_dp_model_load(const char * path, llama_model_params params) 
 
     LLAMA_LOG_INFO("llama_dp: loaded %d data-parallel replicas (one per device 0..%d)\n", n, n - 1);
 
-    llama_model * handle = reinterpret_cast<llama_model *>(dp);
-    reg_add(g_model_handles, handle);
+    // the lead replica's real model is the handle; introspection runs natively on it.
+    llama_model * handle = dp->replicas[0];
+    { std::lock_guard<std::mutex> lk(g_mtx); g_models[handle] = dp; }
     return handle;
 }
 
-const llama_vocab * llama_dp_model_vocab(const llama_model * model) {
-    const auto * dp = reinterpret_cast<const llama_dp_model *>(model);
-    return llama_model_get_vocab(dp->replicas[0]); // identical across replicas
-}
-
 void llama_dp_model_free(llama_model * model) {
-    auto * dp = reinterpret_cast<llama_dp_model *>(model);
-    reg_del(g_model_handles, model);
+    llama_dp_model * dp = lookup(g_models, model);
+    if (!dp) {
+        return;
+    }
+    { std::lock_guard<std::mutex> lk(g_mtx); g_models.erase(model); } // unregister first => stock free below
     for (llama_model * m : dp->replicas) {
         llama_model_free(m);
     }
@@ -185,32 +173,42 @@ void llama_dp_model_free(llama_model * model) {
 // context side
 // ---------------------------------------------------------------------------
 
-llama_context * llama_dp_init(llama_model * dp_model_handle, llama_context_params params) {
-    auto * dpm = reinterpret_cast<llama_dp_model *>(dp_model_handle);
+llama_context * llama_dp_init(llama_model * model, llama_context_params params) {
+    llama_dp_model * dpm = lookup(g_models, model);
+    if (!dpm) {
+        return nullptr;
+    }
     const int n = dpm->n;
 
     auto * dp = new llama_dp_context();
     dp->n = n;
-    dp->model_handle = dp_model_handle;
-    dp->n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(dpm->replicas[0]));
     dp->ctxs.reserve(n);
     dp->mems.reserve(n);
 
+    // unregister the lead model so llama_init_from_model(replicas[0]) takes the stock path.
+    { std::lock_guard<std::mutex> lk(g_mtx); g_models.erase(model); }
+    bool ok = true;
     for (int r = 0; r < n; ++r) {
-        // replica model is a real (non-proxy) model, so this takes the stock path.
         llama_context * c = llama_init_from_model(dpm->replicas[r], params);
         if (!c) {
             LLAMA_LOG_ERROR("llama_dp: failed to create context for replica %d/%d\n", r, n);
-            for (llama_context * prev : dp->ctxs) {
-                llama_free(prev);
-            }
-            delete dp;
-            return nullptr;
+            ok = false;
+            break;
         }
         dp->ctxs.push_back(c);
         dp->mems.push_back(llama_get_memory(c));
     }
+    { std::lock_guard<std::mutex> lk(g_mtx); g_models[model] = dpm; } // restore
 
+    if (!ok) {
+        for (llama_context * c : dp->ctxs) {
+            llama_free(c);
+        }
+        delete dp;
+        return nullptr;
+    }
+
+    dp->n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(dpm->replicas[0]));
     dp->n_kv_max = (int32_t) llama_n_ctx(dp->ctxs[0]);
 
     // per-replica scratch batch (single seq id per token, which is what the bench tools build).
@@ -227,13 +225,17 @@ llama_context * llama_dp_init(llama_model * dp_model_handle, llama_context_param
         dp->workers.emplace_back([dp, r] { dp->worker_loop(r); });
     }
 
-    llama_context * handle = reinterpret_cast<llama_context *>(dp);
-    reg_add(g_ctx_handles, handle);
+    llama_context * handle = dp->ctxs[0];
+    {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        g_ctxs[handle]      = dp;
+        g_mems[dp->mems[0]] = dp;
+    }
     return handle;
 }
 
 int32_t llama_dp_decode(llama_context * ctx, llama_batch batch) {
-    auto * dp = reinterpret_cast<llama_dp_context *>(ctx);
+    llama_dp_context * dp = lookup(g_ctxs, ctx);
     const int n = dp->n;
 
     // shard the batch by sequence id: sequence j -> replica (j % n), local seq id (j / n).
@@ -271,7 +273,6 @@ int32_t llama_dp_decode(llama_context * ctx, llama_batch batch) {
         }
     });
 
-    // first nonzero return wins (matches a single-context decode reporting its own failure).
     for (int r = 0; r < n; ++r) {
         if (dp->ret[r] != 0) {
             return dp->ret[r];
@@ -281,32 +282,12 @@ int32_t llama_dp_decode(llama_context * ctx, llama_batch batch) {
 }
 
 void llama_dp_synchronize(llama_context * ctx) {
-    auto * dp = reinterpret_cast<llama_dp_context *>(ctx);
+    llama_dp_context * dp = lookup(g_ctxs, ctx);
     dp->run_on_all([dp](int r) { llama_synchronize(dp->ctxs[r]); });
 }
 
-uint32_t llama_dp_n_ctx(const llama_context * ctx) {
-    const auto * dp = reinterpret_cast<const llama_dp_context *>(ctx);
-    return llama_n_ctx(dp->ctxs[0]); // identical across replicas
-}
-
-llama_memory_t llama_dp_get_memory(llama_context * ctx) {
-    // the proxy context itself is the memory handle; the memory wrappers route via the registry.
-    return reinterpret_cast<llama_memory_t>(ctx);
-}
-
-uint32_t llama_dp_n_seq_max(const llama_context * ctx) {
-    const auto * dp = reinterpret_cast<const llama_dp_context *>(ctx);
-    return llama_n_seq_max(dp->ctxs[0]); // identical across replicas
-}
-
-const llama_model * llama_dp_get_model(const llama_context * ctx) {
-    const auto * dp = reinterpret_cast<const llama_dp_context *>(ctx);
-    return dp->model_handle; // the proxy model (its vocab routes to replica 0)
-}
-
 float * llama_dp_get_logits_ith(llama_context * ctx, int32_t i) {
-    auto * dp = reinterpret_cast<llama_dp_context *>(ctx);
+    llama_dp_context * dp = lookup(g_ctxs, ctx);
     if (i < 0 || i >= (int) dp->route_r.size()) {
         return nullptr;
     }
@@ -316,7 +297,7 @@ float * llama_dp_get_logits_ith(llama_context * ctx, int32_t i) {
 }
 
 float * llama_dp_get_logits(llama_context * ctx) {
-    auto * dp = reinterpret_cast<llama_dp_context *>(ctx);
+    llama_dp_context * dp = lookup(g_ctxs, ctx);
     // rebuild the requested-output rows in global batch order (what llama_get_logits returns).
     // only reached when n_ctx > n_batch, which forces n_seq == 1 (all tokens on replica 0).
     dp->logits_buf.clear();
@@ -332,17 +313,18 @@ float * llama_dp_get_logits(llama_context * ctx) {
     return dp->logits_buf.data();
 }
 
-void llama_dp_perf_print(const llama_context * ctx) {
-    const auto * dp = reinterpret_cast<const llama_dp_context *>(ctx);
-    for (int r = 0; r < dp->n; ++r) {
-        LLAMA_LOG_INFO("llama_dp: --- replica %d ---\n", r);
-        llama_perf_context_print(dp->ctxs[r]);
-    }
-}
-
 void llama_dp_free(llama_context * ctx) {
-    auto * dp = reinterpret_cast<llama_dp_context *>(ctx);
-    reg_del(g_ctx_handles, ctx);
+    llama_dp_context * dp = lookup(g_ctxs, ctx);
+    if (!dp) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_mtx); // unregister first => stock free below
+        g_ctxs.erase(ctx);
+        if (!dp->mems.empty()) {
+            g_mems.erase(dp->mems[0]);
+        }
+    }
 
     // stop + join the worker pool before tearing down the contexts it touches.
     {
@@ -364,30 +346,31 @@ void llama_dp_free(llama_context * ctx) {
 }
 
 // ---------------------------------------------------------------------------
-// memory side — the handle is the proxy context; route ops to the replicas
+// memory side — the handle is replica 0's real memory; fan ops to every replica.
+// fan via the llama_memory_i methods directly so we don't re-enter the C wrappers.
 // ---------------------------------------------------------------------------
 
 void llama_dp_memory_clear(llama_memory_t mem, bool data) {
-    auto * dp = reinterpret_cast<llama_dp_context *>(mem);
-    dp->run_on_all([dp, data](int r) { llama_memory_clear(dp->mems[r], data); });
+    llama_dp_context * dp = lookup(g_mems, mem);
+    dp->run_on_all([dp, data](int r) { dp->mems[r]->clear(data); });
 }
 
 bool llama_dp_memory_seq_rm(llama_memory_t mem, llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
-    auto * dp = reinterpret_cast<llama_dp_context *>(mem);
+    llama_dp_context * dp = lookup(g_mems, mem);
     const int          n      = dp->n;
     const int          target = (int) (((seq_id % n) + n) % n);
     const llama_seq_id loc    = seq_id / n;
     bool result = true;
     dp->run_on_all([&](int r) {
         if (r == target) {
-            result = llama_memory_seq_rm(dp->mems[r], loc, p0, p1);
+            result = dp->mems[r]->seq_rm(loc, p0, p1);
         }
     });
     return result;
 }
 
 void llama_dp_memory_seq_cp(llama_memory_t mem, llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
-    auto * dp = reinterpret_cast<llama_dp_context *>(mem);
+    llama_dp_context * dp = lookup(g_mems, mem);
     const int n = dp->n;
     const int r_src = (int) (((seq_id_src % n) + n) % n);
     const int r_dst = (int) (((seq_id_dst % n) + n) % n);
@@ -397,17 +380,18 @@ void llama_dp_memory_seq_cp(llama_memory_t mem, llama_seq_id seq_id_src, llama_s
         const llama_seq_id loc_dst = seq_id_dst / n;
         dp->run_on_all([&](int r) {
             if (r == r_src) {
-                llama_memory_seq_cp(dp->mems[r], loc_src, loc_dst, p0, p1);
+                dp->mems[r]->seq_cp(loc_src, loc_dst, p0, p1);
             }
         });
         return;
     }
 
-    // cross-replica copy (the is_pp_shared prefix-broadcast case) is Phase 2; warn once.
-    if (!dp->warned_cross_replica) {
-        dp->warned_cross_replica = true;
-        LLAMA_LOG_WARN("llama_dp: cross-replica seq_cp (seq %d -> %d) not yet supported; "
-                       "is_pp_shared (-pps) is not handled under data parallelism yet\n",
+    // cross-replica copy (the is_pp_shared prefix-broadcast case) is not supported yet.
+    static bool warned = false;
+    if (!warned) {
+        warned = true;
+        LLAMA_LOG_WARN("llama_dp: cross-replica seq_cp (seq %d -> %d) not supported; "
+                       "is_pp_shared (-pps) is not handled under data parallelism\n",
                        seq_id_src, seq_id_dst);
     }
 }

@@ -3488,9 +3488,6 @@ void llama_free(llama_context * ctx) {
 }
 
 uint32_t llama_n_ctx(const llama_context * ctx) {
-    if (llama_dp_is_ctx(ctx)) {
-        return llama_dp_n_ctx(ctx);
-    }
     return ctx->n_ctx();
 }
 
@@ -3507,9 +3504,6 @@ uint32_t llama_n_ubatch(const llama_context * ctx) {
 }
 
 uint32_t llama_n_seq_max(const llama_context * ctx) {
-    if (llama_dp_is_ctx(ctx)) {
-        return llama_dp_n_seq_max(ctx);
-    }
     return ctx->n_seq_max();
 }
 
@@ -3518,9 +3512,6 @@ uint32_t llama_n_rs_seq(const llama_context * ctx) {
 }
 
 const llama_model * llama_get_model(const llama_context * ctx) {
-    if (llama_dp_is_ctx(ctx)) {
-        return llama_dp_get_model(ctx);
-    }
     return &ctx->get_model();
 }
 
@@ -3727,9 +3718,6 @@ int32_t llama_set_adapter_cvec(
 //
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {
-    if (llama_dp_is_ctx(ctx)) {
-        return llama_dp_get_memory(const_cast<llama_context *>(ctx));
-    }
     return ctx->get_memory();
 }
 
@@ -4005,10 +3993,6 @@ llama_perf_context_data llama_perf_context(const llama_context * ctx) {
 }
 
 void llama_perf_context_print(const llama_context * ctx) {
-    if (llama_dp_is_ctx(ctx)) {
-        llama_dp_perf_print(ctx);
-        return;
-    }
     const auto data = llama_perf_context(ctx);
 
     const double t_end_ms = 1e-3 * ggml_time_us();
