@@ -2,6 +2,7 @@
 
 #include "ggml.h"
 #include "llama-arch.h"
+#include "llama-dp.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
 #include "llama-batch.h"
@@ -3388,6 +3389,12 @@ llama_context * llama_init_from_model(
         return nullptr;
     }
 
+    // data-parallel: a proxy model has no llama_model internals to validate; build the proxy
+    // context (one real context per replica) before any model deref below.
+    if (llama_dp_is_model(model)) {
+        return llama_dp_init(model, params);
+    }
+
     if (params.n_batch == 0 && params.n_ubatch == 0) {
         LLAMA_LOG_ERROR("%s: n_batch and n_ubatch cannot both be zero\n", __func__);
         return nullptr;
@@ -3473,10 +3480,17 @@ llama_context * llama_new_context_with_model(
 }
 
 void llama_free(llama_context * ctx) {
+    if (llama_dp_is_ctx(ctx)) {
+        llama_dp_free(ctx);
+        return;
+    }
     delete ctx;
 }
 
 uint32_t llama_n_ctx(const llama_context * ctx) {
+    if (llama_dp_is_ctx(ctx)) {
+        return llama_dp_n_ctx(ctx);
+    }
     return ctx->n_ctx();
 }
 
@@ -3548,6 +3562,10 @@ void llama_set_warmup(llama_context * ctx, bool warmup) {
 }
 
 void llama_synchronize(llama_context * ctx) {
+    if (llama_dp_is_ctx(ctx)) {
+        llama_dp_synchronize(ctx);
+        return;
+    }
     ctx->synchronize();
 }
 
@@ -3697,11 +3715,19 @@ int32_t llama_set_adapter_cvec(
 //
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {
+    if (llama_dp_is_ctx(ctx)) {
+        return llama_dp_get_memory(const_cast<llama_context *>(ctx));
+    }
     return ctx->get_memory();
 }
 
 void llama_memory_clear(llama_memory_t mem, bool data) {
     if (!mem) {
+        return;
+    }
+
+    if (llama_dp_is_mem(mem)) {
+        llama_dp_memory_clear(mem, data);
         return;
     }
 
@@ -3717,6 +3743,10 @@ bool llama_memory_seq_rm(
         return true;
     }
 
+    if (llama_dp_is_mem(mem)) {
+        return llama_dp_memory_seq_rm(mem, seq_id, p0, p1);
+    }
+
     return mem->seq_rm(seq_id, p0, p1);
 }
 
@@ -3727,6 +3757,11 @@ void llama_memory_seq_cp(
              llama_pos p0,
              llama_pos p1) {
     if (!mem) {
+        return;
+    }
+
+    if (llama_dp_is_mem(mem)) {
+        llama_dp_memory_seq_cp(mem, seq_id_src, seq_id_dst, p0, p1);
         return;
     }
 
@@ -3930,6 +3965,9 @@ int32_t llama_encode(
 int32_t llama_decode(
         llama_context * ctx,
           llama_batch   batch) {
+    if (llama_dp_is_ctx(ctx)) {
+        return llama_dp_decode(ctx, batch);
+    }
     const int ret = ctx->decode(batch);
     if (ret != 0 && ret != 1) {
         LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);
@@ -3955,6 +3993,10 @@ llama_perf_context_data llama_perf_context(const llama_context * ctx) {
 }
 
 void llama_perf_context_print(const llama_context * ctx) {
+    if (llama_dp_is_ctx(ctx)) {
+        llama_dp_perf_print(ctx);
+        return;
+    }
     const auto data = llama_perf_context(ctx);
 
     const double t_end_ms = 1e-3 * ggml_time_us();

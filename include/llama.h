@@ -301,6 +301,11 @@ extern "C" {
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         int32_t main_gpu;
 
+        // data-parallel replicas (orchestrator2). when > 1, llama_model_load_from_file builds N
+        // independent replicas (replica r pinned to device r) and llama_init_from_model returns a
+        // proxy context that shards each decode's sequences across them. 0/1 = off (stock path).
+        int32_t n_data_parallel;
+
         // proportion of the model (layers or rows) to offload to each GPU, size: llama_max_devices()
         const float * tensor_split;
 
