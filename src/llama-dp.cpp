@@ -1,8 +1,9 @@
 // src/llama-dp.cpp — see llama-dp.h for the design overview.
 
 #include "llama-dp.h"
-#include "llama-impl.h"   // LLAMA_LOG_*
-#include "llama-memory.h" // call llama_memory_i methods directly when fanning memory ops
+#include "llama-impl.h"    // LLAMA_LOG_*
+#include "llama-memory.h"  // call llama_memory_i methods directly when fanning memory ops
+#include "llama-context.h" // call llama_context methods directly (bypass the C-API registry)
 
 #include <algorithm>
 #include <condition_variable>
@@ -268,8 +269,10 @@ int32_t llama_dp_decode(llama_context * ctx, llama_batch batch) {
 
     std::fill(dp->ret.begin(), dp->ret.end(), (int8_t) 0);
     dp->run_on_all([dp](int r) {
+        // call the context method directly: dp->ctxs[0] is a registered handle, so going through
+        // the public llama_decode() would re-enter this DP layer and deadlock the worker pool.
         if (dp->scratch[r].n_tokens > 0) {
-            dp->ret[r] = (int8_t) llama_decode(dp->ctxs[r], dp->scratch[r]);
+            dp->ret[r] = (int8_t) dp->ctxs[r]->decode(dp->scratch[r]);
         }
     });
 
@@ -283,7 +286,19 @@ int32_t llama_dp_decode(llama_context * ctx, llama_batch batch) {
 
 void llama_dp_synchronize(llama_context * ctx) {
     llama_dp_context * dp = lookup(g_ctxs, ctx);
-    dp->run_on_all([dp](int r) { llama_synchronize(dp->ctxs[r]); });
+    // method, not llama_synchronize(): ctxs[0] is registered and would re-enter this layer.
+    dp->run_on_all([dp](int r) { dp->ctxs[r]->synchronize(); });
+}
+
+// read one token's logits from its replica, mirroring llama_get_logits_ith() but via the context
+// methods directly (the C wrapper would re-enter this layer for the registered ctxs[0] handle).
+static float * dp_logits_ith(llama_context * c, int32_t li) {
+    c->synchronize();
+    float * res = c->get_sampled_logits_ith(li);
+    if (!res) {
+        res = c->get_logits_ith(li);
+    }
+    return res;
 }
 
 float * llama_dp_get_logits_ith(llama_context * ctx, int32_t i) {
@@ -293,7 +308,7 @@ float * llama_dp_get_logits_ith(llama_context * ctx, int32_t i) {
     }
     // the whole sequence that owns token i lives on this replica and is contiguous there, so the
     // caller's contiguous read of the following rows stays valid.
-    return llama_get_logits_ith(dp->ctxs[dp->route_r[i]], dp->route_li[i]);
+    return dp_logits_ith(dp->ctxs[dp->route_r[i]], dp->route_li[i]);
 }
 
 float * llama_dp_get_logits(llama_context * ctx) {
@@ -305,7 +320,7 @@ float * llama_dp_get_logits(llama_context * ctx) {
         if (!dp->route_out[i]) {
             continue;
         }
-        const float * row = llama_get_logits_ith(dp->ctxs[dp->route_r[i]], dp->route_li[i]);
+        const float * row = dp_logits_ith(dp->ctxs[dp->route_r[i]], dp->route_li[i]);
         if (row) {
             dp->logits_buf.insert(dp->logits_buf.end(), row, row + dp->n_vocab);
         }
