@@ -1,6 +1,7 @@
 #include "llama-model.h"
 
 #include "llama-arch.h"
+#include "llama-dp.h"
 #include "llama-ext.h"
 #include "llama-hparams.h"
 #include "llama-impl.h"
@@ -2255,6 +2256,7 @@ llama_model_params llama_model_default_params() {
         /*.n_gpu_layers                =*/ -1,
         /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
         /*.main_gpu                    =*/ 0,
+        /*.n_data_parallel             =*/ 0,
         /*.tensor_split                =*/ nullptr,
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
@@ -2281,6 +2283,10 @@ void llama_free_model(llama_model * model) {
 }
 
 void llama_model_free(llama_model * model) {
+    if (llama_dp_is_model(model)) {
+        llama_dp_model_free(model);
+        return;
+    }
     delete model;
 }
 

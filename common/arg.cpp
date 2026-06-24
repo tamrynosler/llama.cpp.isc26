@@ -2153,6 +2153,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             LOG_WRN("DEPRECATED: --defrag-thold is deprecated and no longer necessary to specify\n");
         }
     ).set_env("LLAMA_ARG_DEFRAG_THOLD"));
+    add_opt(common_arg(
+        {"-dp", "--data-parallel"}, "N",
+        "number of independent model replicas to run concurrently (orchestrator2 data parallelism);\n"
+        "1 (default) is a no-op. Replicas scale throughput, not latency.",
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("--data-parallel must be >= 1");
+            }
+            params.n_data_parallel = value;
+        }
+    ).set_env("LLAMA_ARG_DATA_PARALLEL"));
     if (ex == LLAMA_EXAMPLE_SERVER) {
         // this is to make sure this option appears in the server-specific section of the help message
         add_opt(common_arg(

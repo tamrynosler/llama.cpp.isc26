@@ -1,0 +1,43 @@
+#!/bin/bash
+#SBATCH --job-name=tune-t1
+#SBATCH --output=tune-t1-%j.out.txt
+#SBATCH --error=tune-t1-%j.err.txt
+#SBATCH --partition=workers
+#SBATCH --nodes=1
+#SBATCH --nodelist=xeon-cg2
+# Either 80 GB A100 node works. To use the other one, override on the command line (wins over the
+# line above):   sbatch --nodelist=xeon-cg3 <this script>
+#
+# T-1 single-GPU parameter sweep: 70B Q4_K_M on one 80 GB A100. Workload 512 / 512 (decode-bound).
+#
+# Primary lever = B (parallelism, -npl). Decode is weight-bandwidth-bound at low batch, so batching
+# sequences amortizes weight reads almost linearly until compute saturates, then S t/s plateaus.
+# Find where it flattens (expected ~16-64) -- don't chase the memory ceiling (~107 f16).
+#
+# Secondary lever = -ub: at high npl the prefill phase is npl x 512 tokens (up to 32768), big enough
+# that the ubatch tile affects S_PP. So this is a npl x ub grid (the -ub bash loop x the -npl list).
+#
+# ctx fixed at 65536 = npl_max(64) x (npp+ntg)=1024. f16 KV (plenty of headroom at this tier).
+# -b held at 4096 (>= max ub; not an independent lever).
+#
+# Build (one 80 GB A100, sm_80), on feat/orchestrator2:
+#   ml gcc; ml cuda
+#   cmake -B build-a100 -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=80 -DCMAKE_BUILD_TYPE=Release
+#   cmake --build build-a100 --target llama-batched-bench -j$(nproc)
+
+set -euo pipefail
+source /etc/profile.d/lmod.sh
+module purge
+module load gcc
+module load cuda
+
+BIN="$HOME/llama.cpp.isc26/build-a100/bin/llama-batched-bench"
+M="/shared/llms/models/Llama-3.1-Nemotron-70B-Instruct-HF-Q4_K_M.gguf"
+export CUDA_VISIBLE_DEVICES=0
+
+for UB in 512 1024 2048; do
+    echo ""
+    echo "############################  -ub ${UB}  ############################"
+    "$BIN" -m "$M" -fa on -ngl 999 -c 65536 -b 4096 -ub "$UB" \
+        -npp 512 -ntg 512 -npl 1,2,4,8,16,32,64 || echo "(-ub ${UB} aborted early)"
+done

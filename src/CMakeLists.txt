@@ -17,6 +17,7 @@ add_library(llama
             llama-chat.cpp
             llama-context.cpp
             llama-cparams.cpp
+            llama-dp.cpp
             llama-grammar.cpp
             llama-graph.cpp
             llama-hparams.cpp
@@ -53,6 +54,15 @@ target_include_directories(llama PUBLIC ../include)
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
 target_link_libraries(llama PUBLIC ggml)
+
+# orchestrator2: optional in-source MPI for cross-node data parallelism (llama-dp.cpp).
+# OFF by default => no MPI dependency and the single-node/launcher builds are unchanged.
+option(LLAMA_DP_MPI "llama: build the in-source MPI data-parallel cluster path" OFF)
+if (LLAMA_DP_MPI)
+    find_package(MPI REQUIRED COMPONENTS CXX)
+    target_link_libraries(llama PRIVATE MPI::MPI_CXX)
+    target_compile_definitions(llama PRIVATE LLAMA_DP_MPI)
+endif()
 
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
