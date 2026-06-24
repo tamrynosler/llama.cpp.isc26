@@ -5,6 +5,8 @@
 #SBATCH --partition=workers
 #SBATCH --nodes=1
 #SBATCH --nodelist=xeon-cg2
+# Either 80 GB A100 node works. To use the other one, override on the command line (wins over the
+# line above):   sbatch --nodelist=xeon-cg3 <this script>
 #
 # T-1 single-GPU parameter sweep: 70B Q4_K_M on one 80 GB A100. Workload 512 / 512 (decode-bound).
 #
