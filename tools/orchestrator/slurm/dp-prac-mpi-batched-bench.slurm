@@ -26,9 +26,18 @@ module load gcc
 module load cuda
 module load hpcx
 
+# ---- perf-per-watt throttle (mirrors isc26 maxout): CPUs low + GPUs capped to 200 W ----
+# Uses the isc26 power helpers (ssh-loop over $SLURM_JOB_NODELIST), reached via POWER_DIR (default
+# $HOME/isc26/power). CPU governors are restored on any exit; the per-rank wrapper on the workload
+# below re-raises the working rank's CPUs. GPU cap is left set on exit, same as maxout.
+export POWER="${POWER_DIR:-$HOME/isc26/power}"
+trap "$POWER/reset_nodes_cpus.sh" EXIT INT TERM
+"$POWER/set_nodes_cpus_low.sh"
+"$POWER/set_nodes_gpus_pl.sh" 200
+
 REPO="$HOME/llama.cpp.isc26"
 BIN="$REPO/build-a100-mpi/bin/llama-batched-bench"
-M="/shared/llms/models/nvidia_Llama-3.1-Nemotron-Nano-8B-v1-Q4_K_M.gguf"
+M="/shared/llms/models/Llama-3.1-Nemotron-70B-Instruct-HF-Q4_K_M.gguf"
 
 # each rank pins its node's 2 A100s; the library shards across all ranks via MPI.
 export CUDA_VISIBLE_DEVICES=0,1
@@ -42,6 +51,6 @@ NBATCH=2048
 UBATCH=512
 
 # one rank per node (pmix); --data-parallel 2 = local replicas/node. rank 0 prints the table.
-srun --mpi=pmix --ntasks-per-node=1 "$BIN" \
+srun --mpi=pmix --ntasks-per-node=1 "$POWER/set_rank_cpus_high.sh" "$BIN" \
     -m "$M" -ngl "$NGL" -c "$CTX" -b "$NBATCH" -ub "$UBATCH" \
     -npp "$PP" -ntg "$TG" -npl "$PL" --data-parallel 2

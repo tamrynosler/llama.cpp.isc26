@@ -33,9 +33,18 @@ module purge
 module load gcc
 module load cuda
 
+# ---- perf-per-watt throttle (mirrors isc26 maxout): CPUs low + GPUs capped to 200 W ----
+# Uses the isc26 power helpers (ssh-loop over $SLURM_JOB_NODELIST), reached via POWER_DIR (default
+# $HOME/isc26/power). CPU governors are restored on any exit; the per-rank wrapper on the workload
+# below re-raises the working rank's CPUs. GPU cap is left set on exit, same as maxout.
+export POWER="${POWER_DIR:-$HOME/isc26/power}"
+trap "$POWER/reset_nodes_cpus.sh" EXIT INT TERM
+"$POWER/set_nodes_cpus_low.sh"
+"$POWER/set_nodes_gpus_pl.sh" 200
+
 REPO="$HOME/llama.cpp.isc26"
 BIN="$REPO/build-h100/bin/llama-perplexity"
-M="/shared/llms/models/nvidia_Llama-3.1-Nemotron-Nano-8B-v1-Q4_K_M.gguf"
+M="/shared/llms/models/Llama-3.1-Nemotron-70B-Instruct-HF-Q4_K_M.gguf"
 
 # wikitext-2 raw test split. Adjust if the dataset lives elsewhere on the cluster.
 #   https://huggingface.co/datasets/ggml-org/ci/resolve/main/wikitext-2-raw-v1.zip
@@ -50,8 +59,8 @@ NBATCH=4096
 COMMON=(-m "$M" -f "$DATA" -ngl "$NGL" -c "$CHUNK" -b "$NBATCH")
 
 echo "################  BASELINE PPL: single GPU (no data parallelism)  ################"
-CUDA_VISIBLE_DEVICES=0 "$BIN" "${COMMON[@]}"
+CUDA_VISIBLE_DEVICES=0 "$POWER/set_rank_cpus_high.sh" "$BIN" "${COMMON[@]}"
 
 echo ""
 echo "################  DATA-PARALLEL PPL: --data-parallel 4 (all four H100s)  ################"
-"$BIN" "${COMMON[@]}" --data-parallel 4
+"$POWER/set_rank_cpus_high.sh" "$BIN" "${COMMON[@]}" --data-parallel 4

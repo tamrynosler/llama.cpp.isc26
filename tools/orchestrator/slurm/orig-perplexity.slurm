@@ -28,13 +28,22 @@ module purge
 module load gcc
 module load cuda
 
+# ---- perf-per-watt throttle (mirrors isc26 maxout): CPUs low + GPUs capped to 200 W ----
+# Uses the isc26 power helpers (ssh-loop over $SLURM_JOB_NODELIST), reached via POWER_DIR (default
+# $HOME/isc26/power). CPU governors are restored on any exit; the per-rank wrapper on the workload
+# below re-raises the working rank's CPUs. GPU cap is left set on exit, same as maxout.
+export POWER="${POWER_DIR:-$HOME/isc26/power}"
+trap "$POWER/reset_nodes_cpus.sh" EXIT INT TERM
+"$POWER/set_nodes_cpus_low.sh"
+"$POWER/set_nodes_gpus_pl.sh" 200
+
 ORIG="${ORIG_REPO:-$HOME/llama.cpp-orig}"
 BIN="$ORIG/build/bin/llama-perplexity"
-M="/shared/llms/models/nvidia_Llama-3.1-Nemotron-Nano-8B-v1-Q4_K_M.gguf"
+M="/shared/llms/models/Llama-3.1-Nemotron-70B-Instruct-HF-Q4_K_M.gguf"
 DATA="${WIKITEXT:-/shared/llms/datasets/wikitext-2-raw/wiki.test.raw}"
 
 export CUDA_VISIBLE_DEVICES=0
 
 # same flags as the DP perplexity scripts (-c 512 chunk, -b 4096); PPL is independent of batching.
 echo "################  ORIGINAL upstream llama.cpp perplexity (single GPU)  ################"
-"$BIN" -m "$M" -f "$DATA" -ngl 99 -c 512 -b 4096
+"$POWER/set_rank_cpus_high.sh" "$BIN" -m "$M" -f "$DATA" -ngl 99 -c 512 -b 4096
