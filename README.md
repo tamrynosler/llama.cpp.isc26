@@ -14,7 +14,7 @@ A multitude of building, running, and testing scripts can be found in our main t
 [CHPC-tech-eval/isc26](https://github.com/chpc-tech-eval/isc26)
 We will make this repository public after the competition ends.
 
-An extended report and usage manual of the new functionality can be found in [ISC_REPORT.md](https://github.com/tamrynosler/llama.cpp.isc26/master/ISC_REPORT.md)
+An extended report and usage manual of the new functionality can be found in [https://github.com/tamrynosler/llama.cpp.isc26/master/ISC_REPORT.md](https://github.com/tamrynosler/llama.cpp.isc26/blob/master/ISC_REPORT.md) .
 
 # Original LlaMa.cpp Repo README.md
 
