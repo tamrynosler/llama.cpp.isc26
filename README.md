@@ -10,6 +10,7 @@ Over the Last two months, we designed and implemented this functionality. Initia
 However, when the ISC Competition rules were updated to not allow modifications of the original benchmarking tool (`batched-bench`) source code files, this functionality quickly needed to be moved under the hood. This was completed and successful, but did not achieve as much speedup due to the computation being limited by the prefill phase and spawning of the parallel replicas. The old implementation of data parallelism can be found in the branch `/feat/orchestrator`.
 
 Additionally, multi-node data parallelism was implemented using mpi, and can be called by running the `batched-bench` tool with `mpirun` or `srun`.
+To enable the data parallel mpi functionality, build with `-DLLAMA_DP_MPI=ON`.
 A multitude of building, running, and testing scripts can be found in our main team repository:
 [CHPC-tech-eval/isc26](https://github.com/chpc-tech-eval/isc26)
 We will make this repository public after the competition ends.
