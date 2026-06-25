@@ -1,4 +1,22 @@
-# llama.cpp
+# llama.cpp.isc26
+## Centre for High Performance Computing (CHPC), South Africa
+
+This is a fork of the original llama.cpp repository. It contains additional data parallelism, implemented underneath the `batched-bench` and `perplexity` tools, with no modifications to the original `batched-bench` or `perplexity` core files.
+
+When a `--data-parallel N` flag is added to the input parameter flag list, the code underneath the benchmark spawns `N` replicas of the model, sending them to available GPUs on the current device. Input processing is then sent to each replica to be processed in parallel.
+This allows for almost linear speedup, provided that the problem size and `npl` are large enough to fully utilise all replicas on the devices.
+
+Over the Last two months, we designed and implemented this functionality. Initially, the data parallel workings were at the same level as `batched-bench`, with a separate tool called "orchestrator", and small modifications to `batched-bench`, `perplexity`, `speculative`, etc. to call the "orchestrator" when requested.
+However, when the ISC Competition rules were updated to not allow modifications of the original benchmarking tool (`batched-bench`) source code files, this functionality quickly needed to be moved under the hood. This was completed and successful, but did not achieve as much speedup due to the computation being limited by the prefill phase and spawning of the parallel replicas. The old implementation of data parallelism can be found in the branch `/feat/orchestrator`.
+
+Additionally, multi-node data parallelism was implemented using mpi, and can be called by running the `batched-bench` tool with `mpirun` or `srun`.
+A multitude of building, running, and testing scripts can be found in our main team repository:
+[CHPC-tech-eval/isc26](https://github.com/chpc-tech-eval/isc26)
+We will make this repository public after the competition ends.
+
+An extended report and usage manual of the new functionality can be found in `ISC_REPORT.md`
+
+# Original LlaMa.cpp Repo README.md
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
