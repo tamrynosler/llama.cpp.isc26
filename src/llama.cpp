@@ -4,6 +4,7 @@
 
 #include "llama-chat.h"
 #include "llama-context.h"
+#include "llama-dp.h"
 #include "llama-mmap.h"
 #include "llama-vocab.h"
 #include "llama-model-loader.h"
@@ -426,6 +427,9 @@ struct llama_model * llama_load_model_from_file(
 struct llama_model * llama_model_load_from_file(
         const char * path_model,
         struct llama_model_params params) {
+    if (llama_dp_enabled(params)) {
+        return llama_dp_model_load(path_model, params);
+    }
     std::vector<std::string> splits = {};
     return llama_model_load_from_file_impl(nullptr, nullptr, nullptr, path_model, splits, /*file*/ nullptr, params);
 }
